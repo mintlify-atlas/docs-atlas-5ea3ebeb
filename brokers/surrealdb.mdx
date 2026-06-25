@@ -1,0 +1,547 @@
+---
+title: 'SurrealDB: Embedded and Flexible Broker'
+sidebarTitle: 'SurrealDB'
+description: 'Flexible SurrealDB broker backend for testing and embedded deployments. In-memory, WebSocket, or existing connection support.'
+---
+
+SurrealDB provides a flexible and versatile message broker backend for Broccoli Queue, ideal for testing, embedded deployments, and scenarios where your application already uses SurrealDB. It supports multiple connection modes including in-memory for development and WebSocket connections to a running SurrealDB server.
+
+## Overview
+
+SurrealDB integration offers unique flexibility with the following characteristics:
+
+- **Multiple Connection Modes**: URL-based remote, in-memory ephemeral, or existing database reuse
+- **Development-Friendly**: Perfect for testing without external broker dependencies
+- **Embedded-Ready**: Lightweight in-memory mode for applications bundled with their queue
+- **Flexible Storage**: Supports all SurrealDB storage engines (KV, S3, etc.)
+- **Native Scheduling**: Scheduled messages supported without plugins
+- **Existing Connection Reuse**: Pass an existing `surrealdb::Surreal` connection
+
+## Installation
+
+Enable the `surrealdb` feature in your `Cargo.toml`:
+
+<CodeGroup>
+```toml Cargo.toml
+[dependencies]
+broccoli_queue = { version = "0.4", features = ["surrealdb"] }
+```
+
+```toml Multiple backends
+[dependencies]
+broccoli_queue = { version = "0.4", features = ["redis", "surrealdb"] }
+```
+</CodeGroup>
+
+## Connection Modes
+
+SurrealDB supports three distinct connection patterns:
+
+### 1. In-Memory (Development & Testing)
+
+Perfect for unit tests and CI/CD pipelines:
+
+```rust
+use broccoli_queue::BroccoliQueue;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Ephemeral in-memory queue—no persistence
+    let queue = BroccoliQueue::builder("mem://")
+        .build::<String>()
+        .await?;
+    
+    // Queue is fully functional but lost on shutdown
+    Ok(())
+}
+```
+
+### 2. WebSocket Remote Connection
+
+Connect to a running SurrealDB server:
+
+<CodeGroup>
+```rust Standard Connection
+let queue = BroccoliQueue::builder("ws://localhost:8000")
+    .build::<String>()
+    .await?;
+```
+
+```rust With Credentials
+let queue = BroccoliQueue::builder("ws://user:pass@localhost:8000")
+    .build::<String>()
+    .await?;
+```
+
+```rust TLS Connection
+let queue = BroccoliQueue::builder("wss://localhost:8000")
+    .build::<String>()
+    .await?;
+```
+</CodeGroup>
+
+### 3. Reuse Existing Connection
+
+Pass an existing SurrealDB connection directly:
+
+```rust
+use broccoli_queue::{BroccoliQueue, brokers::broker::BrokerConfig};
+use surrealdb::Surreal;
+use surrealdb::engine::any::Any;
+
+// Your existing database connection
+let db: Surreal<Any> = Surreal::new::<Any>("mem://").await?;
+db.use_ns("app").use_db("mydb").await?;
+
+// Reuse connection in Broccoli
+let config = BrokerConfig {
+    surrealdb_connection: Some(db),
+    ..Default::default()
+};
+
+let queue = BroccoliQueue::builder("ws://unused")  // URL is ignored when connection provided
+    .with_broker_config(config)
+    .build::<String>()
+    .await?;
+```
+
+<Tip>
+When using `builder_with`, the URL passed to `builder()` is ignored—the connection from `BrokerConfig` takes priority. Use any placeholder URL like `ws://unused`.
+</Tip>
+
+## Quick Start
+
+<Steps>
+  <Step title="Choose your connection mode">
+    ```rust
+    // For testing: in-memory
+    let url = "mem://";
+    
+    // For production: remote server
+    let url = "ws://localhost:8000";
+    ```
+  </Step>
+
+  <Step title="Create the queue">
+    ```rust
+    use broccoli_queue::BroccoliQueue;
+
+    let queue = BroccoliQueue::builder(url)
+        .build::<String>()
+        .await?;
+    ```
+  </Step>
+
+  <Step title="Publish messages">
+    ```rust
+    queue.publish("tasks", "Process this", None).await?;
+    ```
+  </Step>
+
+  <Step title="Consume with error handling">
+    ```rust
+    match queue.consume::<String>("tasks", None).await {
+        Ok(msg) => {
+            println!("Got: {}", msg.payload);
+            queue.acknowledge("tasks", &msg).await?;
+        }
+        Err(e) => {
+            eprintln!("Error: {:?}", e);
+            // Retry logic here
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+## Configuration
+
+### BrokerConfig Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pool_connections` | `u8` | 10 | Connection pool size (for remote mode) |
+| `retry_attempts` | `u8` | 3 | Max retry attempts for failed messages |
+| `retry_failed` | `bool` | true | Whether to retry failed messages |
+| `enable_scheduling` | `bool` | false | Enable time-based message scheduling |
+| `surrealdb_connection` | `Option<Surreal<Any>>` | None | Existing connection to reuse |
+
+```rust
+use broccoli_queue::{BroccoliQueue, brokers::broker::BrokerConfig};
+
+let config = BrokerConfig {
+    pool_connections: Some(5),
+    retry_attempts: Some(3),
+    retry_failed: Some(true),
+    enable_scheduling: Some(true),
+    #[cfg(feature = "surrealdb")]
+    surrealdb_connection: None,
+};
+
+let queue = BroccoliQueue::builder("ws://localhost:8000")
+    .with_broker_config(config)
+    .build::<MyMessage>()
+    .await?;
+```
+
+## Message Scheduling
+
+SurrealDB supports native scheduling without additional plugins:
+
+```rust
+use broccoli_queue::queue::PublishOptions;
+use std::time::Duration;
+use time::OffsetDateTime;
+
+let config = BrokerConfig {
+    enable_scheduling: Some(true),
+    ..Default::default()
+};
+
+// Delay message by 2 hours
+queue.publish(
+    "reports",
+    "Generate monthly report",
+    Some(PublishOptions {
+        delay: Some(Duration::from_secs(7200)),
+        ..Default::default()
+    }),
+).await?;
+
+// Schedule for specific time
+let next_week = OffsetDateTime::now_utc() + Duration::days(7);
+queue.publish(
+    "reports",
+    "Generate weekly report",
+    Some(PublishOptions {
+        scheduled_at: Some(next_week),
+        ..Default::default()
+    }),
+).await?;
+```
+
+## Concurrency & Retry Logic
+
+### ⚠️ Non-Idempotent Operation Errors
+
+SurrealDB may return `BrokerNonIdempotentOp` or `BrokerNonIdempotentRetriableOp` errors when multiple concurrent readers access the same queue table:
+
+```rust
+use broccoli_queue::error::BroccoliError;
+
+loop {
+    match queue.consume::<Message>("tasks", None).await {
+        Ok(msg) => {
+            // Process message
+            queue.acknowledge("tasks", &msg).await?;
+        }
+        Err(BroccoliError::Broker(msg)) if msg.contains("NonIdempotent") => {
+            // Retry after brief delay
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
+        }
+        Err(e) => return Err(e),
+    }
+}
+```
+
+### Best Practices for Concurrency
+
+- **Limit concurrent consumers**: SurrealDB performs best with 2-4 concurrent readers
+- **Implement backoff**: Exponential backoff on concurrency errors
+- **Batch operations**: Use `try_consume_batch()` instead of high concurrency
+
+```rust
+// Recommended: Limited concurrency with batch processing
+let tasks = queue.try_consume_batch::<Message>("tasks", 10, None).await?;
+for task in tasks {
+    // Process task
+    queue.acknowledge("tasks", &task).await?;
+}
+```
+
+## Features & Limitations
+
+### ✅ Supported Features
+
+- **Message Publishing**: Full publish with options
+- **Message Consumption**: Single and batch retrieval
+- **Message Rejection**: Retry with incrementing attempt counters
+- **Message Acknowledgment**: Manual confirmation
+- **Message Cancellation**: Remove messages before processing
+- **Message Scheduling**: Native support, no plugins needed
+- **In-Memory Mode**: Perfect for testing
+- **Existing Connection Reuse**: Leverage your existing SurrealDB setup
+
+### ⚠️ Limitations
+
+- **No Fairness Queuing**: Different approach compared to Redis
+- **Limited Concurrency**: Best with 2-4 concurrent readers
+- **Concurrency Errors**: May return `BrokerNonIdempotentOp` under high concurrent load
+- **No Queue Sizing**: Cannot retrieve current queue size via API
+- **Performance**: Slower than Redis for high-throughput scenarios
+
+<Warning>
+Do not use SurrealDB for high-concurrency scenarios requiring thousands of concurrent consumers. Consider Redis for those use cases.
+</Warning>
+
+## Local Development
+
+### In-Memory Queue (Simplest)
+
+```rust
+#[tokio::test]
+async fn test_queue_operations() {
+    let queue = BroccoliQueue::builder("mem://")
+        .build::<String>()
+        .await
+        .expect("Failed to create queue");
+
+    queue.publish("test", "Hello", None).await.expect("Publish failed");
+    
+    let msg = queue.consume::<String>("test", None).await.expect("Consume failed");
+    assert_eq!(msg.payload, "Hello");
+}
+```
+
+### Running SurrealDB Server
+
+Start a local SurrealDB instance:
+
+```bash
+# Install SurrealDB (macOS/Linux)
+curl --proto '=https' --tlsv1.2 -sSf https://install.surrealdb.com | sh
+
+# Run in-memory server
+surreal start --bind 0.0.0.0:8000 mem://
+
+# Run with file persistence
+surreal start --bind 0.0.0.0:8000 file://./surreal.db
+```
+
+### Docker Setup
+
+```bash
+docker run -d \
+  --name surreal \
+  -p 8000:8000 \
+  surrealdb/surrealdb:latest \
+  start --bind 0.0.0.0:8000 mem://
+```
+
+### Docker Compose
+
+```yaml
+version: '3.8'
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    command: start --bind 0.0.0.0:8000 mem://
+    ports:
+      - "8000:8000"
+```
+
+## Use Cases
+
+### 🧪 Testing
+
+Perfect for unit and integration tests:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use broccoli_queue::BroccoliQueue;
+
+    #[tokio::test]
+    async fn test_message_flow() {
+        let queue = BroccoliQueue::builder("mem://")
+            .build::<TestMessage>()
+            .await
+            .unwrap();
+        
+        // Test without external dependencies
+    }
+}
+```
+
+### 🚀 Embedded Deployments
+
+Bundle messaging with your application:
+
+```rust
+// Single-binary deployment with embedded SurrealDB queue
+let db = surrealdb::Surreal::new::<Any>("mem://").await?;
+
+let config = BrokerConfig {
+    surrealdb_connection: Some(db),
+    ..Default::default()
+};
+
+let queue = BroccoliQueue::builder("ws://unused")
+    .with_broker_config(config)
+    .build::<String>()
+    .await?;
+```
+
+### 🔄 Existing SurrealDB Users
+
+Integrate with your SurrealDB application:
+
+```rust
+// Your existing SurrealDB connection
+let my_db: Surreal<Any> = /* ... */;
+
+// Reuse for messaging
+let config = BrokerConfig {
+    surrealdb_connection: Some(my_db.clone()),
+    ..Default::default()
+};
+
+let queue = BroccoliQueue::builder("ws://unused")
+    .with_broker_config(config)
+    .build::<MyMessage>()
+    .await?;
+```
+
+## Data Structure
+
+SurrealDB uses relational tables for queue management:
+
+<Accordion title="Internal Table Architecture">
+  <div>
+    <h4>Message Table: `{queue_name}`</h4>
+    <ul>
+      <li><code>id</code>: Record ID (unique message identifier)</li>
+      <li><code>task_id</code>: UUID for external reference</li>
+      <li><code>payload</code>: JSON message content</li>
+      <li><code>attempts</code>: Number of processing attempts</li>
+      <li><code>created_at</code>: Timestamp</li>
+    </ul>
+
+    <h4>Queue Index Table: `{queue_name}_queue`</h4>
+    <ul>
+      <li><code>priority</code>: Message priority (1-5)</li>
+      <li><code>timestamp</code>: Creation time</li>
+      <li><code>message_id</code>: Reference to message table</li>
+    </ul>
+
+    <h4>Processing Queue Table: `{queue_name}_processing`</h4>
+    <ul>
+      <li><code>id</code>: Reference to queued message</li>
+      <li><code>locked_until</code>: Processing timeout</li>
+    </ul>
+
+    <h4>Failed Messages Table: `{queue_name}_failed`</h4>
+    <ul>
+      <li><code>original_id</code>: Original task ID</li>
+      <li><code>original_msg</code>: Full original message</li>
+      <li><code>failed_at</code>: Failure timestamp</li>
+    </ul>
+
+    <h4>Scheduled Messages Table: `{queue_name}_scheduled`</h4>
+    <ul>
+      <li><code>scheduled_for</code>: Delivery time</li>
+      <li><code>message_id</code>: Reference to message</li>
+    </ul>
+  </div>
+</Accordion>
+
+## Error Handling
+
+Common errors and recovery strategies:
+
+```rust
+use broccoli_queue::error::BroccoliError;
+use std::time::Duration;
+
+loop {
+    match queue.consume::<Message>("tasks", None).await {
+        Ok(msg) => {
+            if process_message(&msg).await.is_ok() {
+                queue.acknowledge("tasks", &msg).await?;
+            } else {
+                queue.reject("tasks", &msg).await?;
+            }
+        }
+        Err(BroccoliError::Broker(e)) if e.contains("NonIdempotent") => {
+            // Concurrency issue—retry with backoff
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        Err(e) => {
+            eprintln!("Unrecoverable error: {:?}", e);
+            break;
+        }
+    }
+}
+```
+
+## Performance Characteristics
+
+Performance varies by connection mode:
+
+| Mode | Throughput | Latency | Best For |
+|------|-----------|---------|----------|
+| In-Memory | ~10K msg/s | &lt;5ms | Testing |
+| File Backend | ~5K msg/s | 5-20ms | Development |
+| WebSocket (local) | ~2K msg/s | 20-50ms | Small deployments |
+| WebSocket (remote) | ~1K msg/s | 50-200ms | Distributed systems |
+
+<Tip>
+Use in-memory mode for tests and file backend for local development. Remote WebSocket is best for small to medium workloads where SurrealDB is separately deployed.
+</Tip>
+
+## Troubleshooting
+
+<Accordion title="NonIdempotentOp errors when consuming">
+  Reduce concurrent consumers:
+  ```rust
+  // Bad: Too many concurrent consumers
+  let tasks = tokio::join_all(
+      vec![1..100].iter().map(|_| queue.consume("q", None))
+  ).await;
+
+  // Good: Limited concurrency
+  for _ in 0..4 {
+      let msg = queue.consume("q", None).await?;
+  }
+  ```
+</Accordion>
+
+<Accordion title="Messages accumulate in processing queue">
+  Use `cancel()` to clean up:
+  ```rust
+  queue.cancel("task_queue", message_id).await?;
+  ```
+</Accordion>
+
+<Accordion title="Cannot connect to remote SurrealDB">
+  <ul>
+    <li>Verify server is running: `curl http://localhost:8000/health`</li>
+    <li>Check connection URL includes credentials if required</li>
+    <li>Ensure network connectivity</li>
+  </ul>
+</Accordion>
+
+<Accordion title="High memory usage with in-memory backend">
+  Clear old messages manually or use file backend for persistence.
+</Accordion>
+
+## Comparing Backends
+
+| Feature | Redis | RabbitMQ | SurrealDB |
+|---------|-------|----------|-----------|
+| Fairness Queuing | ✅ Full | ❌ No | ❌ No |
+| Scheduling | ✅ Native | ⚠️ Plugin | ✅ Native |
+| In-Memory Mode | ❌ No | ❌ No | ✅ Yes |
+| Embedded Ready | ❌ No | ❌ No | ✅ Yes |
+| High Throughput | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | ⭐⭐⭐ |
+| Enterprise Ready | ✅ Yes | ✅ Yes | ⚠️ Growing |
+| Learning Curve | ⭐ Easy | ⭐⭐ Medium | ⭐⭐ Medium |
+
+## Next Steps
+
+- Explore [Redis](/brokers/redis) for high-performance scenarios
+- Review [RabbitMQ](/brokers/rabbitmq) for enterprise features
+- Learn [queue consuming patterns](/guides/consuming)
+- Set up [queue monitoring and management](/guides/management)

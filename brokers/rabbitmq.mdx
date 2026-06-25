@@ -1,0 +1,462 @@
+---
+title: 'RabbitMQ: Enterprise Message Broker Backend'
+sidebarTitle: 'RabbitMQ'
+description: 'Enterprise-grade RabbitMQ broker integration for Broccoli Queue. Configure scheduling with plugins and manage complex routing patterns.'
+---
+
+RabbitMQ provides an enterprise-grade message broker backend for Broccoli Queue, offering reliability, message persistence, and sophisticated routing capabilities. It's ideal for complex distributed systems requiring guaranteed message delivery.
+
+## Overview
+
+RabbitMQ integration uses industry-standard AMQP protocols with the following characteristics:
+
+- **Connection Pool**: Managed via `deadpool-lapin` for efficient resource pooling
+- **Reliability**: Persistent message storage with broker-level durability
+- **Enterprise Features**: Dead-letter exchanges, binding strategies, and virtual hosts
+- **Scheduling**: Requires optional plugin installation for time-based message delivery
+- **Routing**: Support for complex queue hierarchies and binding patterns
+
+## Installation
+
+Enable the `rabbitmq` feature in your `Cargo.toml`:
+
+<CodeGroup>
+```toml Cargo.toml
+[dependencies]
+broccoli_queue = { version = "0.4", features = ["rabbitmq"] }
+```
+
+```toml Multiple backends
+[dependencies]
+broccoli_queue = { version = "0.4", features = ["redis", "rabbitmq"] }
+```
+</CodeGroup>
+
+## Connection URLs
+
+Broccoli Queue supports standard AMQP URL formats:
+
+<CodeGroup>
+```
+amqp://localhost:5672
+```
+
+```
+amqp://user:password@localhost:5672
+```
+
+```
+amqp://user:password@localhost:5672/vhost
+```
+
+```
+amqps://user:password@localhost:5671  # TLS
+```
+</CodeGroup>
+
+## Quick Start
+
+<Steps>
+  <Step title="Create a queue instance">
+    ```rust
+    use broccoli_queue::BroccoliQueue;
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = BroccoliQueue::builder("amqp://localhost:5672")
+            .build::<String>()
+            .await?;
+        Ok(())
+    }
+    ```
+  </Step>
+
+  <Step title="Configure the broker">
+    ```rust
+    use broccoli_queue::{BroccoliQueue, brokers::broker::BrokerConfig};
+
+    let config = BrokerConfig {
+        pool_connections: Some(20),
+        retry_attempts: Some(5),
+        retry_failed: Some(true),
+        enable_scheduling: Some(false),  // requires plugin
+        #[cfg(feature = "surrealdb")]
+        surrealdb_connection: None,
+    };
+
+    let queue = BroccoliQueue::builder("amqp://localhost:5672")
+        .with_broker_config(config)
+        .build::<String>()
+        .await?;
+    ```
+  </Step>
+
+  <Step title="Publish messages">
+    ```rust
+    use broccoli_queue::queue::PublishOptions;
+    use std::time::Duration;
+
+    queue.publish("order_queue", "Process order #123", None).await?;
+
+    // With TTL (message expiration)
+    queue.publish(
+        "order_queue",
+        "Time-sensitive data",
+        Some(PublishOptions {
+            ttl: Some(Duration::from_secs(3600)),
+            priority: Some(1),
+            ..Default::default()
+        }),
+    ).await?;
+    ```
+  </Step>
+
+  <Step title="Consume and process">
+    ```rust
+    let message = queue.consume::<String>("order_queue", None).await?;
+    
+    match process_order(&message.payload) {
+        Ok(_) => queue.acknowledge("order_queue", &message).await?,
+        Err(e) => {
+            eprintln!("Processing failed: {}", e);
+            queue.reject("order_queue", &message).await?;
+        }
+    }
+    ```
+  </Step>
+</Steps>
+
+## Configuration
+
+### BrokerConfig Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pool_connections` | `u8` | 10 | Maximum AMQP channel pool size |
+| `retry_attempts` | `u8` | 3 | Max retry attempts before moving to failed queue |
+| `retry_failed` | `bool` | true | Whether to retry failed messages |
+| `enable_scheduling` | `bool` | false | Enable scheduling (requires plugin) |
+
+<Warning>
+**Scheduling Requirements**: To use message scheduling with RabbitMQ, you must install the `rabbitmq-delayed-message-exchange` plugin. See the [Scheduling Setup](#scheduling-setup) section below.
+</Warning>
+
+## Message Scheduling
+
+### Prerequisites
+
+RabbitMQ scheduling requires the `rabbitmq-delayed-message-exchange` plugin.
+
+### Scheduling Setup
+
+<Steps>
+  <Step title="Download the plugin">
+    Visit the [RabbitMQ plugin repository](https://github.com/rabbitmq/rabbitmq-delayed-message-exchange/releases) and download the version matching your RabbitMQ version.
+  </Step>
+
+  <Step title="Install the plugin">
+    ```bash
+    # Copy plugin to RabbitMQ plugins directory
+    cp rabbitmq_delayed_message_exchange-*.ez \
+      /opt/rabbitmq/plugins/
+
+    # Enable the plugin
+    rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+    ```
+  </Step>
+
+  <Step title="Restart RabbitMQ">
+    ```bash
+    sudo systemctl restart rabbitmq-server
+    ```
+  </Step>
+
+  <Step title="Verify installation">
+    ```bash
+    rabbitmq-plugins list | grep delayed
+    ```
+    Should show: `rabbitmq_delayed_message_exchange`
+  </Step>
+
+  <Step title="Enable scheduling in Broccoli">
+    ```rust
+    let config = BrokerConfig {
+        enable_scheduling: Some(true),
+        ..Default::default()
+    };
+    ```
+  </Step>
+</Steps>
+
+### Using Scheduled Messages
+
+```rust
+use broccoli_queue::queue::PublishOptions;
+use time::OffsetDateTime;
+
+// Delay message by 1 hour
+queue.publish(
+    "scheduled_tasks",
+    "Process report",
+    Some(PublishOptions {
+        delay: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    }),
+).await?;
+
+// Schedule for specific time
+let tomorrow = OffsetDateTime::now_utc() + Duration::days(1);
+queue.publish(
+    "scheduled_tasks",
+    "Process report",
+    Some(PublishOptions {
+        scheduled_at: Some(tomorrow),
+        ..Default::default()
+    }),
+).await?;
+```
+
+## Local Development
+
+### Docker Setup
+
+Run RabbitMQ with the management console:
+
+```bash
+docker run -d \
+  --name broccoli-rabbitmq \
+  -p 5672:5672 \
+  -p 15672:15672 \
+  rabbitmq:4-management
+```
+
+Access the management UI: http://localhost:15672 (guest/guest)
+
+### Docker with Scheduling Plugin
+
+Use the provided Dockerfile for development with scheduling support:
+
+```bash
+# Build the image
+docker build -f Dockerfile.rabbitmq -t broccoli-rabbitmq .
+
+# Run the container
+docker run -d \
+  --name broccoli-rabbitmq \
+  -p 5672:5672 \
+  -p 15672:15672 \
+  broccoli-rabbitmq
+```
+
+### Docker Compose
+
+```yaml
+version: '3.8'
+services:
+  rabbitmq:
+    image: rabbitmq:4-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  rabbitmq-scheduled:
+    build:
+      context: .
+      dockerfile: Dockerfile.rabbitmq
+    ports:
+      - "5673:5672"
+      - "15673:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq_scheduled_data:/var/lib/rabbitmq
+
+volumes:
+  rabbitmq_data:
+  rabbitmq_scheduled_data:
+```
+
+## Features & Limitations
+
+### ✅ Supported Features
+
+- **Message Publishing**: Publish with headers, properties, and routing
+- **Message Consumption**: Single and batch message retrieval
+- **Message Rejection**: Automatic retry with configurable limits
+- **Message Acknowledgment**: Explicit message processing confirmation
+- **TTL Support**: Message expiration via `PublishOptions.ttl`
+- **Priority Levels**: Broker-level priority handling
+- **Virtual Hosts**: Multi-tenant queue isolation
+- **Management API**: Queue inspection and metrics (when management feature enabled)
+
+### ⚠️ Limitations
+
+- **No Fairness Queuing**: Redis is the only backend with full fairness support
+- **No Message Cancellation**: Messages cannot be individually canceled once published
+- **No Queue Sizing**: Cannot retrieve current queue size via API
+- **Plugin Dependency**: Scheduling requires additional plugin installation
+
+<Tip>
+For fairness-dependent workloads, consider using Redis as the primary backend and RabbitMQ as a secondary option for specific use cases.
+</Tip>
+
+## Message Routing
+
+RabbitMQ uses exchange-based routing. Broccoli Queue creates an exchange per broker instance:
+
+<Accordion title="Internal Exchange Architecture">
+  <div>
+    <h4>Exchange Details</h4>
+    <ul>
+      <li><code>Exchange Name</code>: "broccoli"</li>
+      <li><code>Exchange Type</code>: Direct (queue name = routing key)</li>
+      <li><code>Durability</code>: Persistent</li>
+    </ul>
+
+    <h4>Queue Naming</h4>
+    <ul>
+      <li>Queue names map directly to routing keys</li>
+      <li>Failed messages: <code>{queue_name}_failed</code></li>
+      <li>Processing queues handled via delivery tags</li>
+    </ul>
+
+    <h4>Message Properties</h4>
+    <ul>
+      <li><code>message_id</code>: Task ID for correlation</li>
+      <li><code>delivery_mode</code>: 2 (persistent)</li>
+      <li><code>priority</code>: RabbitMQ priority level</li>
+      <li><code>expiration</code>: TTL in milliseconds (if specified)</li>
+      <li><code>headers</code>: Attempt count and custom metadata</li>
+    </ul>
+  </div>
+</Accordion>
+
+## Error Handling
+
+### Connection Pool Errors
+
+```rust
+match queue.publish("my_queue", "message", None).await {
+    Ok(_) => println!("Published successfully"),
+    Err(broccoli_queue::error::BroccoliError::Broker(msg)) => {
+        eprintln!("Connection error: {}", msg);
+    }
+    Err(e) => eprintln!("Unexpected error: {:?}", e),
+}
+```
+
+### Message Processing Errors
+
+```rust
+loop {
+    match queue.consume::<MyMessage>("task_queue", None).await {
+        Ok(msg) => {
+            match process_message(&msg).await {
+                Ok(_) => {
+                    queue.acknowledge("task_queue", &msg).await?;
+                }
+                Err(e) => {
+                    eprintln!("Processing failed: {}", e);
+                    queue.reject("task_queue", &msg).await?;
+                }
+            }
+        }
+        Err(e) => eprintln!("Consumption error: {:?}", e),
+    }
+}
+```
+
+## Production Deployment
+
+### High Availability
+
+<Steps>
+  <Step title="Deploy RabbitMQ cluster">
+    Set up a RabbitMQ cluster with at least 3 nodes for quorum
+  </Step>
+  <Step title="Enable queue mirroring">
+    Configure classic mirrored queues or stream queues for replication
+  </Step>
+  <Step title="Configure DNS load balancing">
+    Use DNS round-robin or a load balancer for connection distribution
+  </Step>
+  <Step title="Monitor broker health">
+    Use RabbitMQ management API for health checks
+  </Step>
+</Steps>
+
+### Performance Tuning
+
+```rust
+let config = BrokerConfig {
+    pool_connections: Some(num_workers * 2),  // 2x workers for headroom
+    retry_attempts: Some(5),
+    retry_failed: Some(true),
+    enable_scheduling: Some(false),  // only if needed
+    #[cfg(feature = "surrealdb")]
+    surrealdb_connection: None,
+};
+```
+
+<Tip>
+Increase `pool_connections` to 2x your worker count. RabbitMQ benefits from higher concurrency than Redis due to different bottlenecks.
+</Tip>
+
+## Troubleshooting
+
+<Accordion title="Cannot connect to broker">
+  <ul>
+    <li>Verify RabbitMQ is running: `sudo systemctl status rabbitmq-server`</li>
+    <li>Check port 5672 is open: `netstat -an | grep 5672`</li>
+    <li>Test connection: `rabbitmqctl eval 'hello.'`</li>
+  </ul>
+</Accordion>
+
+<Accordion title="Scheduled messages not working">
+  <ul>
+    <li>Verify plugin is installed: `rabbitmq-plugins list | grep delayed`</li>
+    <li>Check `enable_scheduling: Some(true)` in BrokerConfig</li>
+    <li>Restart broker after plugin installation</li>
+  </ul>
+</Accordion>
+
+<Accordion title="Message not being consumed">
+  <ul>
+    <li>Check queue exists in management UI: http://localhost:15672</li>
+    <li>Verify queue bindings are correct</li>
+    <li>Check for error messages in RabbitMQ logs: `sudo tail -f /var/log/rabbitmq/rabbit@hostname.log`</li>
+  </ul>
+</Accordion>
+
+<Accordion title="Memory usage high">
+  <ul>
+    <li>Monitor queue depths in management UI</li>
+    <li>Check for stuck messages in failed queues</li>
+    <li>Purge old failed messages: `rabbitmqctl purge_queue {queue_name}_failed`</li>
+  </ul>
+</Accordion>
+
+## Comparing with Redis
+
+| Feature | Redis | RabbitMQ |
+|---------|-------|----------|
+| Fairness Queuing | ✅ Full | ⚠️ No |
+| Scheduling | ✅ Native | ⚠️ Plugin-based |
+| Throughput | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ |
+| Persistence | ⚠️ Optional | ✅ Always |
+| Enterprise Ready | ✅ Yes | ✅ Yes |
+| Virtual Hosts | ⚠️ Manual | ✅ Built-in |
+| Clustering | ⚠️ Complex | ✅ Native |
+
+## Next Steps
+
+- Explore [Redis](/brokers/redis) for maximum performance
+- Try [SurrealDB](/brokers/surrealdb) for embedded scenarios
+- Configure [message consuming patterns](/guides/consuming)
+- Set up [monitoring and queue management](/guides/management)

@@ -1,0 +1,382 @@
+---
+title: Queue Management and Monitoring
+sidebarTitle: Management
+description: Monitor queue health, inspect message counts, and track processing state using management APIs.
+---
+
+The management API provides visibility into queue status and message processing. This feature is optional and requires the `management` Cargo feature.
+
+## Enabling Management Features
+
+Add the management feature to your `Cargo.toml`:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.1", features = ["management"] }
+```
+
+With the feature enabled, `BroccoliQueue` gains two new methods: `queue_status()` and `size()`.
+
+## Queue Status
+
+Get comprehensive status information about a queue with `queue_status()`:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    let status = queue.queue_status(
+        "jobs".to_string(),    // queue name (required, cannot be empty)
+        None,                  // disambiguator (optional, for fairness queues)
+    ).await?;
+
+    println!("Queue: {}", status.name);
+    println!("Type: {}", status.queue_type);
+    println!("Total size: {}", status.size);
+    println!("Processing: {}", status.processing);
+    println!("Failed: {}", status.failed);
+    
+    Ok(())
+}
+```
+
+### QueueStatus Structure
+
+The returned `QueueStatus` contains:
+
+| Field | Description |
+|-------|-------------|
+| **name** | The queue name (or `{topic}_{disambiguator}` for fairness queues) |
+| **queue_type** | Type of queue: Main, Processing, Failed, or Fairness |
+| **size** | Number of messages waiting to be consumed |
+| **processing** | Messages currently being processed (not yet acked/rejected) |
+| **failed** | Messages in the failed queue (exceeded retry limit) |
+| **disambiguator_count** | For fairness queues, count of active partitions (None for non-fairness) |
+
+### Queue Types
+
+```rust
+pub enum QueueType {
+    Main,       // Primary queue where messages wait to be consumed
+    Processing, // Temporary queue for messages being processed
+    Failed,     // Messages that exceeded retry attempts
+    Fairness,   // Partition in a fairness-routed queue
+}
+```
+
+## Queue Size
+
+Get the size of queues with `size()`. For fairness queues, returns sizes per partition:
+
+<Tabs>
+<Tab title="Unfair Queue">
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+let sizes = queue.size("jobs").await?;
+// Returns: {"jobs": 42}
+// 42 messages waiting in the jobs queue
+
+for (queue_name, count) in sizes {
+    println!("{}: {} messages", queue_name, count);
+}
+```
+</Tab>
+
+<Tab title="Fairness Queue">
+```rust
+let sizes = queue.size("notifications").await?;
+// Returns multiple entries:
+// "notifications_customer-1_queue": 10
+// "notifications_customer-2_queue": 15
+// "notifications_customer-3_queue": 5
+// Total: 30 messages across all customers
+
+for (queue_name, count) in sizes {
+    println!("{}: {} messages", queue_name, count);
+}
+```
+</Tab>
+</Tabs>
+
+The `size()` method handles both regular and fairness queues automatically, returning a `HashMap<String, u64>`.
+
+## Monitoring Patterns
+
+### Pattern 1: Health Check Endpoint
+
+```rust
+use broccoli_queue::brokers::management::QueueType;
+
+async fn health_check(queue: &BroccoliQueue) -> Result<(), Box<dyn std::error::Error>> {
+    let status = queue.queue_status("critical_jobs".to_string(), None).await?;
+
+    // Alert if too many messages are backing up
+    if status.size > 1000 {
+        eprintln!("ALERT: {} messages queued", status.size);
+    }
+
+    // Alert if messages are stuck in processing
+    if status.processing > 100 {
+        eprintln!("ALERT: {} messages stuck in processing", status.processing);
+    }
+
+    // Alert if failed queue is growing
+    if status.failed > 50 {
+        eprintln!("ALERT: {} messages in failed queue", status.failed);
+    }
+
+    Ok(())
+}
+```
+
+### Pattern 2: Multi-Queue Monitoring
+
+Monitor multiple queues from a single dashboard:
+
+```rust
+use std::collections::HashMap;
+
+async fn monitor_all_queues(
+    queue: &BroccoliQueue,
+    topics: &[&str],
+) -> Result<HashMap<String, QueueStatus>, Box<dyn std::error::Error>> {
+    let mut statuses = HashMap::new();
+
+    for topic in topics {
+        match queue.queue_status(topic.to_string(), None).await {
+            Ok(status) => {
+                statuses.insert(topic.to_string(), status);
+            }
+            Err(e) => {
+                eprintln!("Failed to get status for {}: {}", topic, e);
+            }
+        }
+    }
+
+    Ok(statuses)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+    let statuses = monitor_all_queues(
+        &queue,
+        &["jobs", "emails", "notifications", "reports"],
+    ).await?;
+
+    for (name, status) in statuses {
+        println!(
+            "{}: size={}, processing={}, failed={}",
+            name, status.size, status.processing, status.failed
+        );
+    }
+
+    Ok(())
+}
+```
+
+### Pattern 3: Fairness Queue Distribution
+
+Monitor message distribution across fairness partitions:
+
+```rust
+async fn check_fairness_distribution(
+    queue: &BroccoliQueue,
+    topic: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Get overall status for fairness queue
+    let overall = queue.queue_status(topic.to_string(), None).await?;
+    
+    println!("Topic: {}", topic);
+    println!("Total messages: {}", overall.size);
+    println!("Active partitions: {:?}", overall.disambiguator_count);
+
+    // Get size breakdown
+    let sizes = queue.size(topic).await?;
+    
+    for (queue_name, count) in sizes {
+        let percentage = (count as f64 / overall.size as f64) * 100.0;
+        println!("  {}: {} ({:.1}%)", queue_name, count, percentage);
+    }
+
+    Ok(())
+}
+```
+
+### Pattern 4: Periodic Status Logging
+
+Run continuous monitoring in the background:
+
+```rust
+use std::sync::Arc;
+
+#[tokio::task]
+async fn continuous_monitor(queue: Arc<BroccoliQueue>) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+
+        match queue.queue_status("jobs".to_string(), None).await {
+            Ok(status) => {
+                log::info!(
+                    "Queue stats - size: {}, processing: {}, failed: {}",
+                    status.size, status.processing, status.failed
+                );
+            }
+            Err(e) => {
+                log::error!("Failed to get queue status: {}", e);
+            }
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = Arc::new(
+        BroccoliQueue::builder("redis://localhost:6379").build().await?
+    );
+
+    let monitor_queue = Arc::clone(&queue);
+    tokio::spawn(continuous_monitor(monitor_queue));
+
+    // Main application logic
+    Ok(())
+}
+```
+
+## Querying with Disambiguators
+
+For fairness queues with disambiguators, query specific partitions:
+
+```rust
+// Get status for all customers combined
+let overall = queue.queue_status("notifications".to_string(), None).await?;
+println!("Total: {}", overall.size);
+println!("Partitions: {:?}", overall.disambiguator_count);
+
+// Get status for specific customer
+let customer_status = queue.queue_status(
+    "notifications".to_string(),
+    Some("customer-123".to_string()),
+).await?;
+println!("Customer 123: {}", customer_status.size);
+
+// Get status for another customer
+let another = queue.queue_status(
+    "notifications".to_string(),
+    Some("customer-456".to_string()),
+).await?;
+println!("Customer 456: {}", another.size);
+```
+
+## Error Handling
+
+The management API has special safety features:
+
+<Warning>
+**Empty queue name prevention**: Passing an empty string as the queue name returns an error. This prevents accidentally scanning all Redis keys with the dangerous KEYS * pattern.
+
+```rust
+// This returns an error
+let result = queue.queue_status("".to_string(), None).await;
+assert!(result.is_err());
+```
+</Warning>
+
+Handle errors appropriately:
+
+```rust
+match queue.queue_status("jobs".to_string(), None).await {
+    Ok(status) => println!("Size: {}", status.size),
+    Err(BroccoliError::QueueStatus(msg)) => {
+        eprintln!("Status query failed: {}", msg);
+    }
+    Err(e) => eprintln!("Unexpected error: {}", e),
+}
+```
+
+## Use Cases
+
+| Use Case | API | Example |
+|----------|-----|---------|
+| Dashboard showing queue depth | `queue_status()` | Monitor message backlog |
+| Alert on queue buildup | `queue_status()` size field | Trigger when size > threshold |
+| Detect stuck messages | `queue_status()` processing field | Alert when processing > limit |
+| Find failed messages | `queue_status()` failed field | Route to DLQ handler |
+| Load balance across workers | `size()` per partition | Start workers based on queue depth |
+| Multi-tenant fairness | `queue_status()` + disambiguator | Verify fair distribution |
+
+## Integration with Metrics Systems
+
+Export queue metrics to Prometheus or similar:
+
+```rust
+use prometheus::{Gauge, Registry};
+
+struct QueueMetrics {
+    size: Gauge,
+    processing: Gauge,
+    failed: Gauge,
+}
+
+async fn update_metrics(
+    queue: &BroccoliQueue,
+    metrics: &QueueMetrics,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = queue.queue_status("jobs".to_string(), None).await?;
+
+    metrics.size.set(status.size as f64);
+    metrics.processing.set(status.processing as f64);
+    metrics.failed.set(status.failed as f64);
+
+    Ok(())
+}
+```
+
+## Best Practices
+
+<Steps>
+<Step title="Monitor queue size regularly">
+Set up a periodic check every 30-60 seconds. Alert if size exceeds thresholds.
+</Step>
+
+<Step title="Never query with empty queue names">
+Always provide explicit queue names. Empty names return errors to prevent KEYS * scans.
+</Step>
+
+<Step title="Use queue status for operational visibility">
+- Detect processing bottlenecks (high processing count)
+- Find stuck messages (stuck in processing too long)
+- Monitor failed queue growth (indicates systematic issues)
+</Step>
+
+<Step title="Monitor fairness queue distribution">
+For multi-tenant systems, regularly check that work is distributed fairly across customers/tenants using the `disambiguator_count` field.
+</Step>
+
+<Step title="Set up alerts">
+Trigger alerts when:
+- Queue size grows beyond normal bounds
+- Failed queue accumulates messages
+- Processing count stays high indefinitely
+</Step>
+
+<Step title="Integrate with dashboards">
+Export queue metrics to Prometheus, Datadog, or similar for visualization and alerting.
+</Step>
+</Steps>
+
+## Troubleshooting
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| "Empty queue name cannot be..." | Query attempted with empty string | Provide explicit queue name |
+| QueueStatus always returns 0 | Non-existent queue | Verify queue name spelling |
+| "Feature not implemented" | `management` feature not enabled | Add `features = ["management"]` to Cargo.toml |
+| Fairness queue shows wrong partition count | Different disambiguators seen as separate queues | Query with specific disambiguator for individual partition stats |

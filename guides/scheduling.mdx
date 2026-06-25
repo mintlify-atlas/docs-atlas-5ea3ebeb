@@ -1,0 +1,367 @@
+---
+title: Scheduling Messages for Future Delivery
+sidebarTitle: Scheduling
+description: Send messages to be processed at specific times or after delays using Broccoli Queue scheduling features.
+---
+
+Broccoli Queue supports scheduling messages for future delivery using two complementary approaches: relative delays and absolute scheduled times.
+
+## Scheduling Concepts
+
+Messages can be scheduled in two ways:
+
+| Approach | Use Case | Example |
+|----------|----------|---------|
+| **Delay** | Relative duration from now | "Run this 30 seconds from now" |
+| **Scheduled Time** | Absolute future timestamp | "Run this on 2024-01-15 at 14:30 UTC" |
+
+Both are set via `PublishOptions` and cannot be used simultaneously—the scheduled message respects whichever is specified.
+
+## Relative Delays
+
+Use the `delay` option to defer a message by a relative duration:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+    let job = JobPayload {
+        id: "delayed-job-1".to_string(),
+        task_name: "send_reminder".to_string(),
+        parameters: "user@example.com".to_string(),
+        created_at: chrono::Utc::now(),
+    };
+
+    // Publish job to run in 5 minutes
+    let options = PublishOptions {
+        delay: Some(Duration::minutes(5)),
+        ..Default::default()
+    };
+
+    let published = queue.publish(
+        "jobs",
+        None,
+        &job,
+        Some(options),
+    ).await?;
+
+    println!("Scheduled message to run in 5 minutes: {}", published.task_id);
+    Ok(())
+}
+```
+
+The delay is calculated from the time the message is published and added to the broker's current time.
+
+## Absolute Scheduled Times
+
+For precise scheduling, use `scheduled_at` with an `OffsetDateTime`:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use time::OffsetDateTime;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+    // Schedule for exactly 2 hours from now
+    let scheduled_time = OffsetDateTime::now_utc() + time::Duration::hours(2);
+
+    let options = PublishOptions {
+        scheduled_at: Some(scheduled_time),
+        ..Default::default()
+    };
+
+    let job = JobPayload {
+        id: "scheduled-job-1".to_string(),
+        task_name: "generate_report".to_string(),
+        parameters: "monthly".to_string(),
+        created_at: chrono::Utc::now(),
+    };
+
+    queue.publish("jobs", None, &job, Some(options)).await?;
+
+    println!("Job scheduled for: {}", scheduled_time);
+    Ok(())
+}
+```
+
+### Using the `time` Crate
+
+Create scheduled times with convenient time operations:
+
+<Tabs>
+<Tab title="Absolute Date">
+```rust
+use time::{OffsetDateTime, Month, PrimitiveDateTime};
+
+// Schedule for January 15, 2024 at 2:30 PM UTC
+let dt = PrimitiveDateTime::new(
+    time::Date::from_calendar_date(2024, Month::January, 15).unwrap(),
+    time::Time::from_hms(14, 30, 0).unwrap(),
+);
+let scheduled = dt.assume_utc();
+```
+</Tab>
+
+<Tab title="From Now">
+```rust
+// Schedule for exactly 24 hours from now
+let scheduled = OffsetDateTime::now_utc() + time::Duration::days(1);
+```
+</Tab>
+
+<Tab title="End of Day">
+```rust
+// Schedule for end of today (11:59 PM UTC)
+let now = OffsetDateTime::now_utc();
+let end_of_day = now
+    .replace_time(time::Time::from_hms(23, 59, 59).unwrap());
+```
+</Tab>
+
+<Tab title="Next Monday">
+```rust
+let now = OffsetDateTime::now_utc();
+let days_until_monday = (1 + 7 - now.weekday().number_days_from_monday()) % 7;
+if days_until_monday == 0 {
+    // Already Monday, schedule for next Monday
+    let next_monday = now + time::Duration::days(7);
+} else {
+    let next_monday = now + time::Duration::days(days_until_monday as i64);
+}
+```
+</Tab>
+</Tabs>
+
+## Enabling Scheduling
+
+Scheduling must be enabled during queue initialization. This is especially important for RabbitMQ:
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .enable_scheduling(true)  // Enable scheduling support
+    .pool_connections(5)
+    .build()
+    .await?;
+```
+
+For **SurrealDB** and **Redis**, scheduling is available by default. For **RabbitMQ**, see the note below.
+
+## Batch Scheduling
+
+You can schedule multiple messages in a single batch:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .enable_scheduling(true)
+        .build()
+        .await?;
+
+    // Create multiple jobs scheduled for 10 seconds from now
+    let scheduled_jobs = vec![
+        JobPayload {
+            id: "job-1".to_string(),
+            task_name: "process_data".to_string(),
+            parameters: "input_1.csv".to_string(),
+            created_at: chrono::Utc::now(),
+        },
+        JobPayload {
+            id: "job-2".to_string(),
+            task_name: "process_data".to_string(),
+            parameters: "input_2.csv".to_string(),
+            created_at: chrono::Utc::now(),
+        },
+        JobPayload {
+            id: "job-3".to_string(),
+            task_name: "generate_report".to_string(),
+            parameters: "monthly".to_string(),
+            created_at: chrono::Utc::now(),
+        },
+    ];
+
+    let options = PublishOptions {
+        delay: Some(Duration::seconds(10)),
+        priority: Some(2),
+        ttl: Some(Duration::hours(1)),
+        scheduled_at: None,
+    };
+
+    let published = queue.publish_batch(
+        "jobs",
+        None,
+        scheduled_jobs,
+        Some(options),
+    ).await?;
+
+    println!("Scheduled {} jobs to run in 10 seconds", published.len());
+    for msg in published {
+        println!("  - {}: {}", msg.payload.id, msg.task_id);
+    }
+
+    Ok(())
+}
+```
+
+All messages in the batch receive the same scheduling parameters.
+
+## Real-World Example: Delayed Reminders
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use time::Duration;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReminderPayload {
+    user_id: String,
+    email: String,
+    message: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .build()
+        .await?;
+
+    // User signs up, send reminder in 24 hours
+    let reminder = ReminderPayload {
+        user_id: "user-123".to_string(),
+        email: "user@example.com".to_string(),
+        message: "Complete your profile".to_string(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let options = PublishOptions {
+        delay: Some(Duration::hours(24)),
+        ..Default::default()
+    };
+
+    queue.publish(
+        "reminders",
+        Some(reminder.user_id.clone()),  // Fair distribution per user
+        &reminder,
+        Some(options),
+    ).await?;
+
+    println!("Reminder scheduled for: {}", reminder.email);
+    Ok(())
+}
+```
+
+## Scheduling on Different Brokers
+
+<Tabs>
+<Tab title="Redis">
+Redis has built-in support for scheduling via sorted sets with score-based ordering. Scheduling works out-of-the-box.
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .enable_scheduling(true)
+    .build()
+    .await?;
+```
+</Tab>
+
+<Tab title="RabbitMQ">
+<Warning>
+RabbitMQ requires the **rabbitmq_delayed_message_exchange** plugin to support message scheduling.
+
+**Installation:**
+```bash
+# Install the plugin
+rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+
+# Restart RabbitMQ
+systemctl restart rabbitmq-server
+```
+
+After installation, enable scheduling:
+
+```rust
+let queue = BroccoliQueue::builder("amqp://localhost:5672")
+    .enable_scheduling(true)
+    .build()
+    .await?;
+```
+
+If the plugin is not installed, scheduling will fail with an error.
+</Warning>
+</Tab>
+
+<Tab title="SurrealDB">
+SurrealDB has built-in timestamp support for scheduling. Scheduling works out-of-the-box.
+
+```rust
+let queue = BroccoliQueue::builder_with(db)
+    .enable_scheduling(true)
+    .build()
+    .await?;
+```
+</Tab>
+</Tabs>
+
+## Best Practices
+
+<Steps>
+<Step title="Use scheduled_at for precise times">
+When you need exact scheduling (e.g., daily reports at 9 AM), use `scheduled_at` with an `OffsetDateTime` instead of delay.
+</Step>
+
+<Step title="Combine with priority and TTL">
+Scheduled messages can also have priority and TTL. Set TTL to prevent extremely old scheduled messages from ever executing:
+
+```rust
+PublishOptions {
+    scheduled_at: Some(schedule_time),
+    ttl: Some(Duration::days(30)),
+    priority: Some(3),
+    ..Default::default()
+}
+```
+</Step>
+
+<Step title="Always enable scheduling if using it">
+While some brokers support it by default, explicitly enable it during initialization to document intent.
+</Step>
+
+<Step title="Avoid scheduling too far in the future">
+Very long delays (months/years) can accumulate in memory on some brokers. Keep scheduled times within reasonable bounds (days/weeks).
+</Step>
+
+<Step title="Test scheduling behavior">
+Ensure your broker supports scheduling before deploying. The broker will error during message publishing if scheduling is not available.
+
+```rust
+// Test that scheduling works
+let test_options = PublishOptions {
+    delay: Some(Duration::seconds(1)),
+    ..Default::default()
+};
+
+queue.publish("test", None, &test_msg, Some(test_options))
+    .await
+    .expect("Scheduling not supported on this broker");
+```
+</Step>
+</Steps>
+
+## Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| "Feature not implemented" error | Enable scheduling: `.enable_scheduling(true)` |
+| RabbitMQ scheduling fails | Install `rabbitmq_delayed_message_exchange` plugin |
+| Scheduled messages appear immediately | Ensure broker time is synchronized (NTP) |
+| Scheduled messages never execute | Check message TTL hasn't expired before scheduled time |

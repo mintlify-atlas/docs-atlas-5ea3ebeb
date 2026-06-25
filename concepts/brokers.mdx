@@ -1,0 +1,361 @@
+---
+title: "Brokers: Backend Storage and Transport Layer"
+sidebarTitle: "Brokers"
+description: "Explore Redis, RabbitMQ, and SurrealDB broker implementations, selection, pooling, and configuration."
+---
+
+Brokers are the backend storage and transport layer for Broccoli. They implement the `Broker` trait and handle queue operations, connection pooling, and persistence. Broccoli supports three backends: Redis, RabbitMQ, and SurrealDB, with automatic selection based on your connection URL scheme.
+
+## The Broker Trait
+
+Every broker implementation provides these core operations:
+
+```rust
+pub trait Broker: Send + Sync {
+    async fn connect(&mut self, broker_url: &str) -> Result<(), BroccoliError>;
+    async fn publish(&self, queue_name: &str, disambiguator: Option<String>, 
+                     message: &[InternalBrokerMessage], 
+                     options: Option<PublishOptions>) -> Result<Vec<InternalBrokerMessage>, BroccoliError>;
+    async fn consume(&self, queue_name: &str, 
+                     options: Option<ConsumeOptions>) -> Result<InternalBrokerMessage, BroccoliError>;
+    async fn try_consume(&self, queue_name: &str, 
+                         options: Option<ConsumeOptions>) -> Result<Option<InternalBrokerMessage>, BroccoliError>;
+    async fn try_consume_batch(&self, queue_name: &str, batch_size: usize, 
+                               options: Option<ConsumeOptions>) -> Result<Vec<InternalBrokerMessage>, BroccoliError>;
+    async fn acknowledge(&self, queue_name: &str, 
+                         message: InternalBrokerMessage) -> Result<(), BroccoliError>;
+    async fn reject(&self, queue_name: &str, 
+                    message: InternalBrokerMessage) -> Result<(), BroccoliError>;
+    async fn cancel(&self, queue_name: &str, message_id: String) -> Result<(), BroccoliError>;
+    async fn size(&self, queue_name: &str) -> Result<HashMap<String, u64>, BroccoliError>;
+}
+```
+
+## Supported Brokers
+
+<CardGroup cols={1}>
+  <Card title="Redis" icon="database">
+    **Default backend** — In-memory data store with persistence. Uses sorted sets for priority queuing, lists for processing/failed queues, and hashes for message metadata.
+    
+    **URL Scheme:** `redis://localhost:6379`
+    
+    **Feature Flag:** Built-in (no flag needed)
+    
+    **Pool:** `bb8` connection pool with configurable size
+    
+    **Best For:** Development, single-region deployments, high throughput with moderate persistence
+  </Card>
+  <Card title="RabbitMQ" icon="messages-square">
+    **Enterprise messaging** — Fully featured message broker with persistence, clustering, and management UI. Uses priority queues and the delayed-exchange plugin for scheduling.
+    
+    **URL Scheme:** `amqp://localhost:5672`
+    
+    **Feature Flag:** `rabbitmq`
+    
+    **Pool:** `deadpool-lapin` connection pool
+    
+    **Best For:** Enterprise deployments, clustering, advanced routing, guaranteed persistence
+    
+    **Note:** Requires RabbitMQ server. For message scheduling, install the delayed-exchange plugin.
+  </Card>
+  <Card title="SurrealDB" icon="database">
+    **Document database** — Multi-model database with strong consistency. Stores messages as documents in tables.
+    
+    **URL Scheme:** `ws://localhost:8000` (WebSocket) or `mem://` (in-memory)
+    
+    **Feature Flag:** `surrealdb`
+    
+    **Pool:** In-memory, no external pool
+    
+    **Best For:** Embedded queues, testing, document-oriented applications
+  </Card>
+</CardGroup>
+
+## Broker Selection
+
+Broccoli automatically detects which broker to use from your connection URL scheme:
+
+```rust
+// Redis
+let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+// RabbitMQ
+let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672").build().await?;
+
+// SurrealDB
+let queue = BroccoliQueue::builder("ws://localhost:8000").build().await?;
+let queue = BroccoliQueue::builder("mem://").build().await?;  // In-memory
+```
+
+URL scheme detection:
+- `redis://` → Redis
+- `amqp://` → RabbitMQ
+- `ws://` or `mem://` → SurrealDB
+
+<Warning>
+Ensure the feature flag is enabled for your chosen broker. If not enabled in `Cargo.toml`, the broker will not be available and you'll get a "Unsupported broker URL scheme" error.
+</Warning>
+
+## Connection Pooling
+
+### Redis: `bb8` Pool
+
+Redis uses a connection pool to manage multiple concurrent connections efficiently.
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(20)  // Default: 10
+    .build()
+    .await?;
+```
+
+Each connection in the pool is independent and ready for immediate use. Pool size affects:
+- **Concurrency capacity** — More connections = more concurrent operations
+- **Memory usage** — Each connection consumes memory
+- **Broker load** — More connections = more load on Redis
+
+**Recommendation:** Start with 10–20 connections and adjust based on your throughput.
+
+### RabbitMQ: `deadpool-lapin` Pool
+
+RabbitMQ also uses a connection pool with similar behavior:
+
+```rust
+let queue = BroccoliQueue::builder("amqp://localhost:5672")
+    .pool_connections(10)
+    .build()
+    .await?;
+```
+
+The pool handles AMQP channels and manages broker connectivity.
+
+### SurrealDB: No Pool
+
+SurrealDB connections are lightweight in-memory references, so pooling is not needed.
+
+```rust
+// For WebSocket
+let queue = BroccoliQueue::builder("ws://localhost:8000").build().await?;
+
+// For embedded in-memory
+let queue = BroccoliQueue::builder("mem://").build().await?;
+```
+
+Alternatively, reuse an existing SurrealDB connection:
+
+```rust
+let db = surrealdb::Surreal::new::<surrealdb::engine::any::Any>("ws://localhost:8000")
+    .await?;
+
+let queue = BroccoliQueue::builder_with(db).build().await?;
+```
+
+## Broker Configuration
+
+Configure broker behavior via `BrokerConfig`:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+let retry_strategy = RetryStrategy::new()
+    .with_attempts(5)
+    .retry_failed(true);
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(retry_strategy)
+    .pool_connections(15)
+    .enable_scheduling(true)
+    .build()
+    .await?;
+```
+
+### Configuration Fields
+
+| Setting | Type | Default | Purpose |
+|---------|------|---------|---------|
+| `retry_attempts` | `Option<u8>` | `Some(3)` | Max retries before moving to failed queue |
+| `retry_failed` | `Option<bool>` | `Some(true)` | Whether to retry at all |
+| `pool_connections` | `Option<u8>` | `Some(10)` | Connection pool size (Redis/RabbitMQ only) |
+| `enable_scheduling` | `Option<bool>` | `Some(false)` | Enable message delays and scheduling |
+
+## Feature Flags
+
+Enable brokers via Cargo.toml:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.1", features = ["redis"] }
+```
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.1", features = ["rabbitmq"] }
+```
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.1", features = ["surrealdb"] }
+```
+
+Use multiple brokers in the same application:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.1", features = ["redis", "rabbitmq"] }
+```
+
+## Broker Comparison
+
+<Tabs>
+  <Tab title="Redis">
+    **Strengths:**
+    - Fast in-memory operations
+    - Simple to set up and scale
+    - Excellent for development
+    - Built-in persistence options (RDB, AOF)
+    - Supports fairness queuing
+    
+    **Weaknesses:**
+    - Data loss risk if not persisted
+    - Single-server bottleneck (without clustering)
+    - Memory constraints on large queues
+    
+    **Best For:** Fast, throughput-focused queues with moderate retention
+  </Tab>
+  
+  <Tab title="RabbitMQ">
+    **Strengths:**
+    - Enterprise-grade reliability
+    - Built-in clustering and HA
+    - Rich management UI
+    - Strong durability guarantees
+    - Complex routing options
+    
+    **Weaknesses:**
+    - Higher operational overhead
+    - More resource-intensive
+    - Slower than Redis for simple use cases
+    - Requires more configuration
+    
+    **Best For:** Production systems, clustering, guaranteed delivery
+  </Tab>
+  
+  <Tab title="SurrealDB">
+    **Strengths:**
+    - Embedded or networked
+    - Document-oriented model
+    - In-memory mode for testing
+    - Full SQL support
+    - Multi-model database
+    
+    **Weaknesses:**
+    - Newest/least proven
+    - Smaller ecosystem
+    - No fairness support yet
+    - Different operational model
+    
+    **Best For:** Embedded queues, testing, document-oriented apps
+  </Tab>
+</Tabs>
+
+## Enabling Message Scheduling
+
+Message scheduling (delays and scheduled times) requires:
+
+**For Redis:** Built-in support
+```rust
+.enable_scheduling(true)
+```
+
+**For RabbitMQ:** Requires the delayed-exchange plugin
+```bash
+rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+```
+Then enable in Broccoli:
+```rust
+.enable_scheduling(true)
+```
+
+**For SurrealDB:** Built-in support
+```rust
+.enable_scheduling(true)
+```
+
+## Health Checking and Monitoring
+
+Use the `size()` method to monitor queue depth:
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+loop {
+    let sizes = queue.size("orders").await?;
+    for (queue_name, count) in sizes {
+        println!("{}: {} messages", queue_name, count);
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+}
+```
+
+Output example:
+```
+orders: 150 messages
+orders_processing: 12 messages
+orders_failed: 3 messages
+```
+
+## Example: Multi-Broker Setup
+
+Switch between brokers by changing the URL:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+async fn create_queue(broker_url: &str) -> Result<BroccoliQueue, Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder(broker_url)
+        .pool_connections(10)
+        .enable_scheduling(true)
+        .build()
+        .await?;
+    
+    Ok(queue)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Develop with Redis
+    let dev_queue = create_queue("redis://localhost:6379").await?;
+    
+    // Deploy with RabbitMQ
+    let prod_queue = create_queue("amqp://rabbitmq.prod:5672").await?;
+    
+    // Test with SurrealDB in-memory
+    let test_queue = create_queue("mem://").await?;
+    
+    Ok(())
+}
+```
+
+## Key Characteristics
+
+<CardGroup cols={2}>
+  <Card title="Auto-Detection" icon="wand-magic-sparkles">
+    Broker selected automatically from URL scheme.
+  </Card>
+  <Card title="Pluggable" icon="plug">
+    Custom brokers can implement the `Broker` trait.
+  </Card>
+  <Card title="Connection Pooling" icon="network-wired">
+    Efficient resource management with configurable pools.
+  </Card>
+  <Card title="Feature Gated" icon="lock">
+    Enable only the brokers you need via Cargo features.
+  </Card>
+</CardGroup>
+
+## What's Next?
+
+- **[Queue](/concepts/queue)** — Main API and lifecycle
+- **[Messages](/concepts/messages)** — Payload structure and identity
+- **[Retry Strategy](/concepts/retry-strategy)** — Configure failure handling
+- **[Fairness](/concepts/fairness)** — Fair round-robin consumption

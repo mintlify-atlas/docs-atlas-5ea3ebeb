@@ -1,0 +1,258 @@
+---
+title: "BrokerMessage: Generic Message Wrapper Type"
+sidebarTitle: "BrokerMessage"
+description: "Type-safe generic wrapper for broker messages with UUID tracking, retry counting, and fairness routing support."
+---
+
+The `BrokerMessage<T>` is a generic type that wraps message payloads with metadata for tracking and processing. It provides type safety, automatic UUID generation, attempt tracking, and support for fairness-based routing.
+
+## Overview
+
+`BrokerMessage<T>` serves as the standard message format throughout Broccoli. Every message consumed from or published to the queue is wrapped in this type, where `T` represents your application-specific payload type.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrokerMessage<T: Clone> {
+    pub task_id: uuid::Uuid,
+    pub payload: T,
+    pub attempts: u8,
+    pub disambiguator: Option<String>,
+}
+```
+
+## Type Parameters
+
+<ResponseField name="T" type="Generic">
+  The payload type. Must implement `Clone + Serialize + DeserializeOwned`. This is your application-specific message data.
+</ResponseField>
+
+## Fields
+
+<ResponseField name="task_id" type="uuid::Uuid">
+  Unique identifier for the message, automatically generated as a UUID v4. Used for tracking, idempotency, and message deduplication across the system.
+</ResponseField>
+
+<ResponseField name="payload" type="T">
+  The actual message content of type `T`. This is the data your handler processes.
+</ResponseField>
+
+<ResponseField name="attempts" type="u8">
+  The number of processing attempts made on this message. Starts at `0` when first published. Incremented each time the handler rejects the message. When `attempts >= retry_limit`, the message moves to the failed queue.
+</ResponseField>
+
+<ResponseField name="disambiguator" type="Option<String>">
+  Optional routing key for fairness-based queue distribution. When set, messages are routed to queue-specific buckets to ensure fair processing across different clients or users. Used with fairness queues in Redis broker.
+</ResponseField>
+
+## Constructor
+
+### `new(payload, disambiguator)`
+
+Creates a new `BrokerMessage` with the provided payload.
+
+```rust
+impl<T: Clone + Serialize> BrokerMessage<T> {
+    pub fn new(payload: T, disambiguator: Option<String>) -> Self
+}
+```
+
+**Parameters:**
+- `payload` - Your message data
+- `disambiguator` - Optional fairness routing key
+
+**Returns:** A new `BrokerMessage<T>` with `task_id` auto-generated as UUID v4, `attempts` set to 0
+
+**Example:**
+
+```rust
+#[derive(Clone, Serialize, Deserialize)]
+struct JobPayload {
+    job_id: String,
+    task: String,
+}
+
+let msg = BrokerMessage::new(
+    JobPayload {
+        job_id: "123".to_string(),
+        task: "process".to_string(),
+    },
+    Some("user_456".to_string()),
+);
+```
+
+## Usage in Publishers
+
+When publishing messages using `queue.publish()`, the method returns a `BrokerMessage<T>`:
+
+```rust
+let result: BrokerMessage<JobPayload> = queue
+    .publish("jobs", None, &job_payload, None)
+    .await?;
+
+println!("Published message with ID: {}", result.task_id);
+println!("Initial attempts: {}", result.attempts); // 0
+```
+
+## Usage in Handlers
+
+When consuming messages with `queue.consume()` or `queue.process_messages()`, you receive a `BrokerMessage<T>`:
+
+```rust
+queue.process_messages("jobs", None, None, |message: BrokerMessage<JobPayload>| async move {
+    // Access fields directly
+    println!("Task ID: {}", message.task_id);
+    println!("Attempts so far: {}", message.attempts);
+    
+    // Use the payload
+    let job = message.payload;
+    match process_job(&job).await {
+        Ok(_) => {
+            println!("Job completed successfully");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Job failed: {}", e);
+            Err(BroccoliError::Job(e.to_string()))
+        }
+    }
+}).await?;
+```
+
+## Accessing Message Fields
+
+Once you have a `BrokerMessage<T>`, all public fields are directly accessible:
+
+```rust
+let message: BrokerMessage<String> = queue.consume("topic", None).await?;
+
+// Direct field access
+let id = message.task_id;           // UUID
+let payload = message.payload;      // String
+let attempt_num = message.attempts; // u8
+let router = message.disambiguator; // Option<String>
+
+// Example with conditional logic based on attempts
+if message.attempts == 0 {
+    println!("First attempt at processing");
+} else if message.attempts >= 3 {
+    println!("Multiple retries already made");
+}
+```
+
+## Fairness Routing
+
+The `disambiguator` field enables fair message distribution:
+
+```rust
+// Publish with fairness routing
+queue.publish(
+    "notifications",
+    Some("customer_789".to_string()), // disambiguator
+    &notification,
+    None
+).await?;
+
+// Messages from customer_789 get fair processing priority
+// Messages are queued separately by disambiguator value
+```
+
+<Note>
+  The `metadata` field exists on `BrokerMessage` but is crate-private (`pub(crate)`). It is not part of the public API and should not be accessed from outside the library.
+</Note>
+
+## Related Types
+
+### QueueType
+
+Represents the category of queue a message may be in:
+
+<ResponseField name="QueueType" type="enum">
+  - `Main` - Primary processing queue
+  - `Processing` - Messages currently being handled
+  - `Failed` - Messages that exceeded retry attempts
+  - `Fairness` - Fair-distribution queue for disambiguated routing
+</ResponseField>
+
+### QueueStatus
+
+Contains information about queue state when inspecting queues with the management feature:
+
+<ResponseField name="name" type="String">
+  The queue name
+</ResponseField>
+
+<ResponseField name="queue_type" type="QueueType">
+  The type of queue
+</ResponseField>
+
+<ResponseField name="size" type="usize">
+  Number of pending messages
+</ResponseField>
+
+<ResponseField name="processing" type="usize">
+  Number of messages currently being processed
+</ResponseField>
+
+<ResponseField name="failed" type="usize">
+  Number of messages in the failed queue
+</ResponseField>
+
+<ResponseField name="disambiguator_count" type="Option<usize>">
+  For fairness queues, the number of distinct disambiguator values
+</ResponseField>
+
+## Batch Operations
+
+`BrokerMessage` also works with batch operations:
+
+```rust
+// Publish batch
+let messages = vec![job1, job2, job3];
+let published: Vec<BrokerMessage<JobPayload>> = queue
+    .publish_batch("jobs", None, messages, None)
+    .await?;
+
+for msg in published {
+    println!("Published {}", msg.task_id);
+}
+
+// Consume batch
+let batch: Vec<BrokerMessage<JobPayload>> = queue
+    .try_consume_batch("jobs", 10, None)
+    .await?;
+
+for msg in batch {
+    println!("Consumed {}: {:?}", msg.task_id, msg.payload);
+}
+```
+
+## Type Safety
+
+The generic parameter `T` ensures type safety throughout the lifecycle:
+
+```rust
+// Compile-time type checking
+let msg_typed: BrokerMessage<JobPayload> = queue.consume("jobs", None).await?;
+// This works:
+let payload: JobPayload = msg_typed.payload;
+
+// This would fail to compile:
+// let wrong: BrokerMessage<OtherType> = msg_typed; // Type mismatch
+```
+
+## Serialization
+
+`BrokerMessage<T>` is serializable/deserializable via `serde`:
+
+```rust
+use serde_json;
+
+let msg = BrokerMessage::new(
+    serde_json::json!({"key": "value"}),
+    None
+);
+
+let json = serde_json::to_string(&msg)?;
+println!("{}", json);
+// Output includes task_id, payload, attempts, disambiguator
+```

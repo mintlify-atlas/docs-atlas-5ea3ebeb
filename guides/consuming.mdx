@@ -1,0 +1,422 @@
+---
+title: Consuming and Processing Messages
+sidebarTitle: Consuming
+description: Master message consumption patterns from blocking to concurrent processing with automatic acknowledgment and error handling.
+---
+
+Broccoli Queue provides multiple consumption patterns to fit different application needs, from simple blocking consumption to highly concurrent worker pools with custom callbacks.
+
+## Manual Consumption
+
+### Blocking Consume
+
+Use `consume()` to wait for a message. This method blocks until a message is available:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .build()
+        .await?;
+
+    // Blocks until a message arrives
+    let message = queue.consume::<JobPayload>("jobs", None).await?;
+    
+    println!("Received job: {}", message.payload.id);
+    println!("Message ID: {}", message.task_id);
+    println!("Attempt: {}", message.attempts);
+
+    // Must acknowledge or reject when done
+    queue.acknowledge("jobs", message).await?;
+
+    Ok(())
+}
+```
+
+### Non-Blocking Try-Consume
+
+Use `try_consume()` to check for messages without blocking:
+
+```rust
+// Returns immediately with Option<BrokerMessage>
+match queue.try_consume::<JobPayload>("jobs", None).await? {
+    Some(message) => {
+        println!("Processing: {}", message.payload.id);
+        queue.acknowledge("jobs", message).await?;
+    }
+    None => {
+        println!("No messages available");
+    }
+}
+```
+
+## Batch Consumption
+
+### With Timeout
+
+Consume up to N messages with a timeout:
+
+```rust
+use time::Duration;
+
+let messages = queue.consume_batch::<JobPayload>(
+    "jobs",
+    10,                              // batch size
+    Duration::seconds(5),            // timeout
+    None,                            // options
+).await?;
+
+println!("Received {} messages", messages.len());
+for msg in messages {
+    queue.acknowledge("jobs", msg).await?;
+}
+```
+
+The method waits up to the timeout duration or until `batch_size` messages arrive, whichever comes first.
+
+### Non-Blocking Batch
+
+Consume available messages without waiting:
+
+```rust
+let messages = queue.try_consume_batch::<JobPayload>(
+    "jobs",
+    10,     // max batch size
+    None,
+).await?;
+
+println!("Found {} available messages", messages.len());
+for msg in messages {
+    queue.acknowledge("jobs", msg).await?;
+}
+```
+
+Returns immediately with however many messages are currently available (0 to batch_size).
+
+## Message Acknowledgment Lifecycle
+
+After consuming a message, you must either acknowledge or reject it:
+
+<Tabs>
+<Tab title="Acknowledge">
+Acknowledge marks the message as successfully processed and removes it permanently:
+
+```rust
+let message = queue.consume::<JobPayload>("jobs", None).await?;
+
+// Do work...
+process_job(&message.payload).await?;
+
+// Acknowledge success
+queue.acknowledge("jobs", message).await?;
+```
+</Tab>
+
+<Tab title="Reject">
+Reject moves the message to a retry queue or failed queue based on retry configuration:
+
+```rust
+let message = queue.consume::<JobPayload>("jobs", None).await?;
+
+// Work failed
+if let Err(e) = process_job(&message.payload).await {
+    eprintln!("Processing failed: {}", e);
+    queue.reject("jobs", message).await?;
+}
+```
+</Tab>
+
+<Tab title="Cancel">
+Cancel permanently removes the message without counting retries:
+
+```rust
+let message = queue.consume::<JobPayload>("jobs", None).await?;
+
+// This message should never be retried
+queue.cancel("jobs", message.task_id.to_string()).await?;
+```
+</Tab>
+</Tabs>
+
+## High-Level Worker Loop
+
+For most applications, use `process_messages()` to run a worker loop with automatic concurrency management:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, ConsumeOptions};
+
+async fn process_job(msg: JobPayload) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Processing: {}", msg.id);
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+    // Run 4 concurrent workers
+    queue.process_messages(
+        "jobs",
+        Some(4),  // concurrency
+        None,     // consume options
+        |msg| async move {
+            process_job(msg.payload).await.map_err(|e| {
+                broccoli_queue::error::BroccoliError::Job(e.to_string())
+            })
+        },
+    ).await?;
+
+    // This never returns (infinite loop)
+    Ok(())
+}
+```
+
+The handler receives a `BrokerMessage<T>` and should return `Result<(), BroccoliError>`:
+- **Success**: Message is automatically acknowledged
+- **Error**: Message is automatically rejected
+
+<Tip>
+The concurrency parameter spawns N independent tokio tasks. Each task consumes messages and runs them concurrently without blocking others.
+</Tip>
+
+## Advanced Worker Loop with Callbacks
+
+Use `process_messages_with_handlers()` for fine-grained control over success and error handling:
+
+```rust
+use broccoli_queue::error::BroccoliError;
+
+async fn handle_message(msg: JobPayload) -> Result<String, BroccoliError> {
+    println!("Processing: {}", msg.id);
+    // Simulate work
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    Ok(format!("Result for {}", msg.id))
+}
+
+async fn on_success(
+    msg: JobPayload,
+    result: String,
+) -> Result<(), BroccoliError> {
+    println!("Success! {}: {}", msg.id, result);
+    // Could log to database, update metrics, etc.
+    Ok(())
+}
+
+async fn on_error(
+    msg: JobPayload,
+    error: BroccoliError,
+) -> Result<(), BroccoliError> {
+    eprintln!("Error processing {}: {}", msg.id, error);
+    // Could send alerts, log errors, etc.
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+    queue.process_messages_with_handlers(
+        "jobs",
+        Some(8),  // 8 concurrent workers
+        None,
+        |msg| async move { handle_message(msg.payload).await },
+        |msg, result| async move { on_success(msg.payload, result).await },
+        |msg, error| async move { on_error(msg.payload, error).await },
+    ).await?;
+
+    Ok(())
+}
+```
+
+The handler callbacks are:
+- **message_handler**: Main processing logic. Returns `Result<T, BroccoliError>`
+- **on_success**: Called after successful message handling (gets the result)
+- **on_error**: Called if message handling fails (gets the error)
+
+## ConsumeOptions
+
+Control consumption behavior with `ConsumeOptions`:
+
+<CardGroup cols={2}>
+<Card title="auto_ack" icon="check">
+Automatically acknowledge messages immediately upon consumption (before processing):
+
+```rust
+ConsumeOptions {
+    auto_ack: Some(true),
+    ..Default::default()
+}
+```
+
+**Use when**: Fire-and-forget processing where you don't care if handling fails.
+</Card>
+
+<Card title="fairness" icon="scale">
+Enable fairness queue consumption. With disambiguators, ensures fair distribution across partitions:
+
+```rust
+ConsumeOptions {
+    fairness: Some(true),
+    ..Default::default()
+}
+```
+
+**Use when**: Publishing with disambiguators (customer IDs, tenant IDs, etc.).
+</Card>
+
+<Card title="consume_wait" icon="pause">
+Add a sleep between tight consume loop iterations. Allows tokio task cancellation:
+
+```rust
+ConsumeOptions {
+    consume_wait: Some(std::time::Duration::from_millis(10)),
+    ..Default::default()
+}
+```
+
+**Use when**: Running in `tokio::spawn()` where you need graceful shutdown.
+</Card>
+
+<Card title="handler_ack" icon="hand-thumbs-up">
+Auto-acknowledge after successful handler execution. Default true. Set false to skip auto-ack:
+
+```rust
+ConsumeOptions {
+    handler_ack: Some(false),
+    ..Default::default()
+}
+```
+
+**Use when**: Handlers spawn long-running tasks and need manual ack later.
+</Card>
+</CardGroup>
+
+### Using ConsumeOptionsBuilder
+
+For cleaner code, use the builder:
+
+```rust
+let options = broccoli_queue::queue::ConsumeOptions::builder()
+    .auto_ack(false)
+    .fairness(true)
+    .consume_wait(std::time::Duration::from_millis(5))
+    .handler_ack(true)
+    .build();
+
+queue.consume::<JobPayload>("jobs", Some(options)).await?;
+```
+
+## Concurrency Patterns
+
+### Pattern 1: Simple Concurrent Workers
+
+```rust
+queue.process_messages(
+    "jobs",
+    Some(4),  // 4 parallel workers
+    None,
+    |msg| async move {
+        // Each worker processes one message at a time
+        process_job(msg.payload).await
+    },
+).await?;
+```
+
+Four tokio tasks are spawned. Each independently consumes and processes messages.
+
+### Pattern 2: Consuming Batches with Processing
+
+```rust
+let options = ConsumeOptions::builder()
+    .consume_wait(std::time::Duration::from_millis(1))
+    .build();
+
+loop {
+    let messages = queue.try_consume_batch::<JobPayload>(
+        "jobs",
+        50,  // process up to 50 at a time
+        Some(options.clone()),
+    ).await?;
+
+    for msg in messages {
+        process_job(msg.payload).await?;
+        queue.acknowledge("jobs", msg).await?;
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+```
+
+### Pattern 3: Spawning Per-Message Tasks
+
+For CPU-bound work, spawn each message as a separate task:
+
+```rust
+let options = ConsumeOptions::builder()
+    .handler_ack(false)  // Manual ack later
+    .consume_wait(std::time::Duration::from_millis(1))
+    .build();
+
+loop {
+    if let Ok(Some(msg)) = queue.try_consume::<JobPayload>("jobs", Some(options.clone())).await {
+        let queue_clone = queue.clone();
+        let topic = "jobs".to_string();
+        
+        tokio::spawn(async move {
+            // Long-running work in background
+            match process_job(msg.payload).await {
+                Ok(()) => {
+                    let _ = queue_clone.acknowledge(&topic, msg).await;
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    let _ = queue_clone.reject(&topic, msg).await;
+                }
+            }
+        });
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+```
+
+## Best Practices
+
+<Steps>
+<Step title="Always handle both success and error">
+Whether using manual ack or automatic handling, ensure messages are properly acknowledged or rejected to prevent accumulation.
+</Step>
+
+<Step title="Set consume_wait for graceful shutdown">
+When running in spawned tasks, add a `consume_wait` to allow tokio to interrupt tight loops on shutdown.
+
+```rust
+let options = ConsumeOptions::builder()
+    .consume_wait(std::time::Duration::from_millis(1))
+    .build();
+```
+</Step>
+
+<Step title="Choose the right concurrency level">
+Start with CPU cores + 1-2. Monitor performance and adjust based on your workload (I/O vs CPU bound).
+</Step>
+
+<Step title="Use fairness queues for multi-tenant systems">
+Enable fairness and provide disambiguators (tenant/customer IDs) to prevent one tenant from starving others.
+</Step>
+
+<Step title="Implement timeout handling">
+Long-running handlers can cause memory pressure. Consider wrapping handlers in a timeout:
+
+```rust
+let timeout = std::time::Duration::from_secs(30);
+tokio::time::timeout(timeout, process_job(&msg.payload))
+    .await
+    .map_err(|_| BroccoliError::Job("Processing timeout".to_string()))?
+```
+</Step>
+</Steps>

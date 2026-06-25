@@ -1,0 +1,124 @@
+---
+title: "Broccoli: Async Rust Message Queue for Celery Users"
+sidebarTitle: "Introduction"
+description: "Broccoli is a robust, type-safe message queue for Rust applications, designed as a modern alternative to Celery. Build reliable async job processing with multiple broker backends."
+---
+
+**Broccoli is a robust message queue system for Rust applications**, designed as a modern alternative to Celery with full async/await support, type safety, and multiple broker backends. It's built for developers who want Rust's performance and type guarantees in their job processing layer.
+
+## Why Broccoli?
+
+If you're familiar with Celery but want to leverage Rust's performance and type safety, Broccoli is your answer. While Celery is a powerful, battle-tested job queue for Python, it has limitations in compiled languages:
+
+- **Weak typing**: Python's dynamic typing can lead to runtime errors in Celery tasks
+- **GIL constraints**: Python's Global Interpreter Lock limits concurrency
+- **Performance overhead**: Serialization and network overhead in distributed Python systems
+- **Language barrier**: Celery doesn't integrate natively with Rust's ownership model
+
+Broccoli brings the familiar Celery paradigm to Rust, with a consistent API across multiple message brokers.
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Fully Async" icon="zap">
+    Built on Tokio with async/await throughout. Efficient concurrent message processing with minimal overhead.
+  </Card>
+  <Card title="Type-Safe Messages" icon="shield">
+    Leverage Rust's type system. Messages are deserialized directly into your structs with compile-time safety.
+  </Card>
+  <Card title="Multiple Brokers" icon="layer-group">
+    Choose your backend: Redis (default), RabbitMQ, or SurrealDB. Same API, different persistence models.
+  </Card>
+  <Card title="Retry & Scheduling" icon="clock">
+    Built-in retry strategies, delayed message delivery, scheduled task execution, and TTL support.
+  </Card>
+  <Card title="Fair Queueing" icon="balance-scale">
+    Optional fairness queue testing to ensure equitable task distribution across workers.
+  </Card>
+  <Card title="Concurrency Control" icon="gears">
+    Configure worker pools, concurrency limits, and connection pooling for optimal throughput.
+  </Card>
+</CardGroup>
+
+## Current Status & Roadmap
+
+Broccoli is actively maintained and production-ready for Redis and RabbitMQ workloads.
+
+**Completed:**
+- ✅ Redis broker implementation
+- ✅ RabbitMQ broker support
+- ✅ Connection pooling
+- ✅ Retry strategies
+- ✅ Scheduled and delayed messages
+- ✅ Management API (optional feature)
+
+**Planned:**
+- 🚧 Kafka broker support
+- 🚧 Proc macros for task definitions
+- 🚧 Enhanced monitoring and metrics
+- 🚧 Web UI for job monitoring
+- 🚧 Additional message patterns
+
+## Broccoli vs. Celery
+
+| Aspect | Broccoli | Celery |
+|--------|----------|--------|
+| **Language** | Rust (compiled) | Python (interpreted) |
+| **Type Safety** | Full compile-time typing | Runtime validation |
+| **Performance** | High (native binaries) | Moderate (GIL overhead) |
+| **Async/Await** | Native throughout | Thread/gevent-based |
+| **Brokers** | Redis, RabbitMQ, SurrealDB | Redis, RabbitMQ, many others |
+| **Learning Curve** | Moderate (Rust syntax) | Gentle (Python simplicity) |
+| **Maturity** | Active development | Battle-tested (10+ years) |
+
+**Choose Broccoli if you:**
+- Want Rust's safety and performance in a job queue
+- Prefer compiled, type-safe task definitions
+- Need native async/await throughout
+- Are building Rust services and want consistency
+
+**Celery remains better if you:**
+- Prefer Python's simplicity and development speed
+- Need broader ecosystem integration
+- Rely on Celery-specific plugins or third-party extensions
+
+## Architecture Overview
+
+Broccoli follows a classic producer-consumer pattern:
+
+1. **Publishers** send serialized messages to a broker
+2. **Brokers** persist messages (Redis, RabbitMQ, or SurrealDB)
+3. **Consumers** fetch and process messages with configurable concurrency
+4. **Error handling** supports retries, custom handlers, and failure recovery
+
+All communication is async-first, allowing high throughput with minimal resource consumption.
+
+## Get Started
+
+Ready to build your first job queue?
+
+<CardGroup>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get working code in 5 minutes with a Redis publisher and consumer.
+  </Card>
+  <Card title="Installation" icon="download" href="/installation">
+    Add Broccoli to your project and configure your broker backend.
+  </Card>
+  <Card title="Concepts" icon="lightbulb" href="/concepts/queue">
+    Learn the key abstractions: queues, messages, workers, and retry strategies.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/broccoli-queue">
+    Explore the complete `BroccoliQueue` API and configuration options.
+  </Card>
+</CardGroup>
+
+## Community & Contributions
+
+Broccoli is open-source under the MIT license. We're actively seeking contributions, especially for:
+
+- New broker implementations
+- Performance optimizations
+- Documentation and examples
+- Bug fixes and feature requests
+
+Have questions? Found a bug? [Open an issue on GitHub](https://github.com/densumesh/broccoli).

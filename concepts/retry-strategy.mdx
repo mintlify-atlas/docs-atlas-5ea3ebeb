@@ -1,0 +1,412 @@
+---
+title: "Retry Strategy: Failed Message Handling and Recovery"
+sidebarTitle: "Retry Strategy"
+description: "Configure retry attempts, enable/disable retries, and manage messages that exhaust retries."
+---
+
+`RetryStrategy` controls how Broccoli handles messages that fail during processing. It defines the maximum number of retry attempts and whether to retry failed messages at all. When a message exhausts its retries, it moves to the failed queue for later inspection or manual recovery.
+
+## RetryStrategy Structure
+
+```rust
+pub struct RetryStrategy {
+    pub retry_failed: bool,      // Whether to retry failed messages
+    pub attempts: Option<u8>,    // Max retry attempts (default: 3)
+}
+```
+
+## Default Behavior
+
+The default `RetryStrategy` allows up to 3 retry attempts:
+
+```rust
+// All three are equivalent:
+let strategy = RetryStrategy::default();
+let strategy = RetryStrategy::new();
+let strategy = RetryStrategy::new()
+    .with_attempts(3)
+    .retry_failed(true);
+
+assert_eq!(strategy.retry_failed, true);
+assert_eq!(strategy.attempts, Some(3));
+```
+
+## Builder Pattern
+
+Create and customize retry strategies with the fluent builder:
+
+```rust
+use broccoli_queue::queue::RetryStrategy;
+
+// No retries
+let no_retry = RetryStrategy::new()
+    .retry_failed(false);
+
+// 5 retry attempts
+let five_retries = RetryStrategy::new()
+    .with_attempts(5)
+    .retry_failed(true);
+
+// 10 retries for unreliable operations
+let aggressive_retry = RetryStrategy::new()
+    .with_attempts(10);
+
+// Immediate failure (1 attempt total, 0 retries)
+let fail_fast = RetryStrategy::new()
+    .with_attempts(0)
+    .retry_failed(false);
+```
+
+### Builder Methods
+
+<CardGroup cols={2}>
+  <Card title="new()" icon="circle-plus">
+    Creates a new strategy with defaults (3 attempts, retries enabled).
+  </Card>
+  <Card title="with_attempts(n)" icon="repeat">
+    Sets the maximum number of retry attempts. Value range: 0–255.
+  </Card>
+  <Card title="retry_failed(bool)" icon="toggle-right">
+    Enables (`true`) or disables (`false`) message retrying entirely.
+  </Card>
+</CardGroup>
+
+## Applying Retry Strategy to Queue
+
+Set the retry strategy when building your queue:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+let strategy = RetryStrategy::new()
+    .with_attempts(5)
+    .retry_failed(true);
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(strategy)
+    .build()
+    .await?;
+```
+
+All messages published through this queue will follow the strategy.
+
+## How Retries Work
+
+<Steps>
+  <Step title="Consume">
+    Consumer calls `queue.consume()` and receives a message with `attempts = 0`.
+  </Step>
+  <Step title="Process">
+    Consumer processes the message. If processing succeeds, it calls `acknowledge()`.
+  </Step>
+  <Step title="Reject on Failure">
+    If processing fails, consumer calls `reject()`. Broccoli increments `attempts`.
+  </Step>
+  <Step title="Re-queue or Fail">
+    If `attempts < max_attempts`, message returns to main queue. Otherwise, it moves to the failed queue.
+  </Step>
+  <Step title="Retry Attempt">
+    Next consumer consumes the message again with `attempts = 1, 2, ...` until success or exhaustion.
+  </Step>
+</Steps>
+
+## Common Retry Patterns
+
+### Pattern 1: Aggressive Retries (Transient Failures)
+
+For network calls that might occasionally fail:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+// Retry up to 5 times for transient network errors
+let strategy = RetryStrategy::new().with_attempts(5);
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(strategy)
+    .build()
+    .await?;
+
+// Consumer
+let msg = queue.consume::<ApiCall>("api_tasks", None).await?;
+match call_external_api(&msg.payload).await {
+    Ok(_) => queue.acknowledge("api_tasks", msg).await?,
+    Err(e) if e.is_transient() => {
+        println!("Transient error (attempt {}): {}", msg.attempts, e);
+        queue.reject("api_tasks", msg).await?;
+    }
+    Err(e) => {
+        eprintln!("Fatal error: {}", e);
+        queue.reject("api_tasks", msg).await?;  // Will eventually hit failed queue
+    }
+}
+```
+
+### Pattern 2: No Retries (Fail Fast)
+
+For messages that should succeed immediately or be discarded:
+
+```rust
+// Disable retries entirely
+let strategy = RetryStrategy::new()
+    .retry_failed(false);
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(strategy)
+    .build()
+    .await?;
+
+// Messages will go straight to the failed queue on first rejection
+```
+
+### Pattern 3: Default Retries (Safe Baseline)
+
+For general-purpose work:
+
+```rust
+// Default: 3 retries, retries enabled
+let strategy = RetryStrategy::default();
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(strategy)
+    .build()
+    .await?;
+```
+
+### Pattern 4: Per-Topic Handling
+
+Use multiple queues with different strategies:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+// High-priority tasks get more retries
+let important_queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(RetryStrategy::new().with_attempts(10))
+    .build()
+    .await?;
+
+// Low-priority tasks fail fast
+let unimportant_queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(
+        RetryStrategy::new()
+            .retry_failed(false)
+    )
+    .build()
+    .await?;
+
+important_queue
+    .publish("critical_jobs", None, &payload, None)
+    .await?;
+
+unimportant_queue
+    .publish("fire_and_forget", None, &payload, None)
+    .await?;
+```
+
+## Message State on Retry
+
+When a message is rejected and retried, its state evolves:
+
+```rust
+// First consumption
+let msg = queue.consume::<Task>("tasks", None).await?;
+assert_eq!(msg.attempts, 0);
+
+// Reject on first try
+queue.reject("tasks", msg.clone()).await?;
+
+// Wait a moment, then consume again
+tokio::time::sleep(Duration::from_millis(100)).await;
+
+// Second consumption
+let retried = queue.consume::<Task>("tasks", None).await?;
+assert_eq!(retried.attempts, 1);  // Incremented
+assert_eq!(retried.task_id, msg.task_id);  // Same ID
+assert_eq!(retried.payload, msg.payload);  // Same payload
+```
+
+The `task_id` and `payload` remain constant; only `attempts` increases.
+
+## Failed Queue Management
+
+When a message exhausts its retry attempts, it moves to the failed queue:
+
+```
+{topic}_failed              // Unfair mode
+{topic}_{disambiguator}_failed  // Fairness mode
+```
+
+### Inspecting Failed Messages
+
+```rust
+use broccoli_queue::queue::ConsumeOptions;
+
+// Try to consume from the main queue
+let msg = queue.try_consume::<Task>("tasks", None).await?;
+assert!(msg.is_none());  // All messages exhausted retries
+
+// Manually check failed queue via broker
+#[cfg(feature = "redis")]
+{
+    let mut redis = redis::Client::open("redis://localhost:6379")?
+        .get_async_connection()
+        .await?;
+    
+    let failed_count: usize = redis.llen("tasks_failed").await?;
+    println!("Failed messages: {}", failed_count);
+}
+```
+
+### Reprocessing Failed Messages
+
+To retry failed messages manually:
+
+```rust
+use broccoli_queue::queue::ConsumeOptions;
+
+#[cfg(feature = "redis")]
+async fn reprocess_failed(queue: &BroccoliQueue, topic: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let mut redis = redis::Client::open("redis://localhost:6379")?
+        .get_async_connection()
+        .await?;
+    
+    let failed_queue = format!("{}_failed", topic);
+    
+    // Pop from failed queue
+    if let Some(msg_json) = redis.lpop::<_, Option<String>>(&failed_queue, None).await? {
+        // Re-parse and republish
+        let internal_msg: InternalBrokerMessage = serde_json::from_str(&msg_json)?;
+        let msg: BrokerMessage<Task> = internal_msg.into_message()?;
+        
+        // Reset attempts to 0 for fresh retry
+        let mut fresh_msg = msg;
+        fresh_msg.attempts = 0;
+        
+        // Republish
+        queue.publish(topic, None, &fresh_msg.payload, None).await?;
+        println!("Reprocessing message: {}", fresh_msg.task_id);
+    }
+    
+    Ok(())
+}
+```
+
+## Monitoring Retry Behavior
+
+Track retry metrics in your consumer:
+
+```rust
+use std::collections::HashMap;
+
+async fn process_with_metrics(queue: &BroccoliQueue, topic: &str) {
+    let mut metrics = HashMap::new();
+
+    loop {
+        let msg = queue.consume::<Task>(topic, None).await.ok();
+        
+        if let Some(msg) = msg {
+            let attempts = msg.attempts;
+            
+            // Track attempts distribution
+            *metrics.entry(attempts).or_insert(0) += 1;
+            
+            match process_task(&msg.payload).await {
+                Ok(_) => {
+                    queue.acknowledge(topic, msg).await.ok();
+                    println!("Success on attempt: {}", attempts);
+                }
+                Err(e) => {
+                    println!("Failure on attempt {}: {}", attempts, e);
+                    queue.reject(topic, msg).await.ok();
+                }
+            }
+            
+            // Log metrics
+            if metrics.len() > 0 {
+                eprintln!("Attempt distribution: {:?}", metrics);
+            }
+        }
+    }
+}
+
+async fn process_task(payload: &Task) -> Result<(), String> {
+    // Simulate work
+    Ok(())
+}
+```
+
+## Edge Cases
+
+### Zero Attempts
+
+`with_attempts(0)` means "no retries" — message fails on first rejection:
+
+```rust
+let strategy = RetryStrategy::new()
+    .with_attempts(0);
+```
+
+### Max Attempts (255)
+
+The maximum value is `u8::MAX` = 255:
+
+```rust
+let strategy = RetryStrategy::new()
+    .with_attempts(255);
+```
+
+### Disabling All Retries
+
+Setting `retry_failed(false)` overrides `attempts`:
+
+```rust
+let strategy = RetryStrategy::new()
+    .with_attempts(10)
+    .retry_failed(false);
+
+// Despite with_attempts(10), this queue will NOT retry
+```
+
+## Configuration Examples
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+// Scenario 1: Email sending (transient network, safe to retry)
+let email_strategy = RetryStrategy::new().with_attempts(5);
+
+// Scenario 2: Payment processing (must not duplicate, fail fast)
+let payment_strategy = RetryStrategy::new()
+    .retry_failed(false);
+
+// Scenario 3: Data export (can tolerate delays, needs success)
+let export_strategy = RetryStrategy::new().with_attempts(10);
+
+// Scenario 4: Test/development (aggressive retries for debugging)
+let test_strategy = RetryStrategy::new().with_attempts(20);
+```
+
+## Key Characteristics
+
+<CardGroup cols={2}>
+  <Card title="Configurable" icon="sliders-horizontal">
+    Fine-tune retry attempts from 0 to 255.
+  </Card>
+  <Card title="Toggleable" icon="toggle-left">
+    Enable or disable retries entirely via `retry_failed`.
+  </Card>
+  <Card title="Failed Queue" icon="inbox-out">
+    Exhausted messages move to `{topic}_failed` for manual recovery.
+  </Card>
+  <Card title="Traceable" icon="chart-mixed">
+    Message `attempts` field tracks retry count.
+  </Card>
+</CardGroup>
+
+## What's Next?
+
+- **[Queue](/concepts/queue)** — Main API and lifecycle
+- **[Messages](/concepts/messages)** — Payload structure and attempt tracking
+- **[Brokers](/concepts/brokers)** — Backend storage systems
+- **[Fairness](/concepts/fairness)** — Fair consumption with disambiguators

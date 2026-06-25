@@ -1,0 +1,210 @@
+---
+title: "BroccoliQueue: Central Message Coordinator"
+sidebarTitle: "Queue"
+description: "Learn how BroccoliQueue manages publish, consume, and lifecycle operations with builder patterns and thread-safe queue management."
+---
+
+`BroccoliQueue` is the main entry point for all message queue operations in Broccoli. It coordinates publishing, consuming, and processing messages across a distributed message broker. Built on the builder pattern, it provides a clean, fluent API for queue configuration and management.
+
+## What is BroccoliQueue?
+
+`BroccoliQueue` serves as a central coordinator between your application and the underlying message broker (Redis, RabbitMQ, or SurrealDB). It wraps broker-specific implementations and provides a unified interface for:
+
+- **Publishing** messages to named topics
+- **Consuming** messages with optional auto-acknowledgment
+- **Processing** messages with concurrent handlers
+- **Managing** message lifecycle (acknowledge, reject, cancel)
+- **Monitoring** queue sizes and status
+
+The queue itself is **thread-safe** and **cloneable**. Internally it uses `Arc` for reference counting, allowing you to share a single `BroccoliQueue` instance across multiple threads and async tasks without synchronization overhead.
+
+## Building a Queue with BroccoliQueueBuilder
+
+Create a `BroccoliQueue` using the fluent builder pattern:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(10)
+    .enable_scheduling(true)
+    .build()
+    .await?;
+```
+
+### Builder Methods
+
+<CardGroup cols={2}>
+  <Card title="new(broker_url)" icon="circle-plus">
+    Creates a new builder with the specified broker URL. Supports `redis://`, `amqp://`, `ws://`, and `mem://` schemes.
+  </Card>
+  <Card title="pool_connections(n)" icon="server">
+    Sets the connection pool size. Default is 10. Higher values support more concurrent operations.
+  </Card>
+  <Card title="enable_scheduling(bool)" icon="clock">
+    Enables message scheduling and delays. Default is false. For RabbitMQ, requires the delayed-exchange plugin.
+  </Card>
+  <Card title="failed_message_retry_strategy(strategy)" icon="rotate">
+    Configures retry behavior for failed messages using a `RetryStrategy`.
+  </Card>
+</CardGroup>
+
+<Info>
+For SurrealDB with an existing connection, use `BroccoliQueue::builder_with(db)` instead.
+</Info>
+
+## Queue Lifecycle
+
+Messages flow through well-defined states during their lifecycle:
+
+<Steps>
+  <Step title="Publish">
+    A message is published to a named topic via `queue.publish()`. The message receives a unique UUID `task_id` and optional `disambiguator` for fairness.
+  </Step>
+  <Step title="Queued">
+    The message sits in the main queue (`{topic}` or `{topic}_{disambiguator}_queue` for fairness) sorted by priority and delay.
+  </Step>
+  <Step title="Consumed">
+    A consumer calls `queue.consume()` or `queue.try_consume()`, moving the message to a processing queue (`{topic}_processing` or `{topic}_{disambiguator}_processing`).
+  </Step>
+  <Step title="Acknowledge or Reject">
+    After processing, the consumer either acknowledges (removing the message) or rejects it (moving to retry or failed queue).
+  </Step>
+  <Step title="Retry or Failed">
+    Rejected messages increment their retry counter. If retries remain, the message returns to the main queue. Otherwise, it moves to the failed queue (`{topic}_failed` or `{topic}_{disambiguator}_failed`).
+  </Step>
+</Steps>
+
+## Internal Queue Naming
+
+Broccoli automatically manages multiple internal queues for each topic:
+
+| Queue Name | Purpose |
+|-----------|---------|
+| `{topic}` | Main queue for pending messages (unfair mode) |
+| `{topic}_processing` | Messages currently being processed (unfair mode) |
+| `{topic}_failed` | Messages that exhausted retry attempts (unfair mode) |
+| `{topic}_{disambiguator}_queue` | Messages from a specific disambiguator (fairness mode) |
+| `{topic}_{disambiguator}_processing` | Processing messages for a disambiguator (fairness mode) |
+| `{topic}_{disambiguator}_failed` | Failed messages from a disambiguator (fairness mode) |
+
+When fairness is enabled, additional tracking structures are created:
+- `{topic}_fairness_set` — Tracks all active disambiguators
+- `{topic}_fairness_round_robin` — Stores the current position in the round-robin cycle
+
+## Example: Queue Lifecycle
+
+```rust
+use broccoli_queue::queue::{
+    BroccoliQueue, ConsumeOptionsBuilder, PublishOptions,
+};
+use serde::{Deserialize, Serialize};
+use time::Duration;
+
+#[derive(Clone, Serialize, Deserialize)]
+struct OrderPayload {
+    order_id: String,
+    user_id: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Build the queue
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .build()
+        .await?;
+
+    // Publish a message
+    let order = OrderPayload {
+        order_id: "ORD-123".to_string(),
+        user_id: "USER-456".to_string(),
+    };
+
+    let published = queue
+        .publish("orders", None, &order, None)
+        .await?;
+    println!("Published message with ID: {}", published.task_id);
+
+    // Consume the message
+    let consumed = queue
+        .consume::<OrderPayload>("orders", None)
+        .await?;
+
+    // Process the message
+    println!("Processing order: {:?}", consumed.payload);
+
+    // Acknowledge successful processing
+    queue.acknowledge("orders", consumed).await?;
+
+    Ok(())
+}
+```
+
+## Thread Safety and Cloning
+
+`BroccoliQueue` is safe to share across threads and can be cheaply cloned:
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .build()
+    .await?;
+
+// Clone the queue for use in multiple tasks
+let queue1 = queue.clone();
+let queue2 = queue.clone();
+
+tokio::spawn(async move {
+    // queue1 can be used here
+    queue1.publish("topic", None, &message, None).await.ok();
+});
+
+tokio::spawn(async move {
+    // queue2 can be used here
+    queue2.consume::<Msg>("topic", None).await.ok();
+});
+
+// Original queue can still be used
+queue.size("topic").await.ok();
+```
+
+All clones reference the same underlying broker connection pool through `Arc`, so cloning is very efficient.
+
+## Naming Conventions
+
+Topic names are arbitrary strings. Choose names that reflect your domain:
+
+- `"orders"` — Order processing queue
+- `"emails"` — Email sending queue
+- `"jobs.high_priority"` — High-priority job processing
+- `"webhooks.user_events"` — User event webhooks
+
+Broccoli automatically appends suffixes for internal queues (`_processing`, `_failed`, etc.), so keep topic names reasonably short.
+
+<Warning>
+Do not manually create or manage the internal queues with suffixes. Broccoli owns them completely. Any manual manipulation may corrupt queue state.
+</Warning>
+
+## Key Characteristics
+
+<CardGroup cols={2}>
+  <Card title="Async/Await" icon="bolt">
+    All operations are async and work seamlessly with Tokio and other async runtimes.
+  </Card>
+  <Card title="Zero-Copy" icon="zap">
+    Messages are serialized to JSON and stored in the broker; cloning `BroccoliQueue` itself is cheap.
+  </Card>
+  <Card title="Broker Agnostic" icon="network-wired">
+    Same API works across Redis, RabbitMQ, and SurrealDB via auto-detection from URL scheme.
+  </Card>
+  <Card title="Error Handling" icon="circle-alert">
+    All operations return `Result<T, BroccoliError>` for proper error propagation.
+  </Card>
+</CardGroup>
+
+## What's Next?
+
+- **[Messages](/concepts/messages)** — Understand `BrokerMessage<T>` structure and payload types
+- **[Brokers](/concepts/brokers)** — Learn about broker implementations and selection
+- **[Retry Strategy](/concepts/retry-strategy)** — Configure how failed messages are retried
+- **[Fairness](/concepts/fairness)** — Enable round-robin consumption across message producers

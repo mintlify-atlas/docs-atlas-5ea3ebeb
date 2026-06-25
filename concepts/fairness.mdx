@@ -1,0 +1,420 @@
+---
+title: "Fairness: Round-Robin Consumption Across Producers"
+sidebarTitle: "Fairness"
+description: "Enable fair message distribution to prevent producer starvation using disambiguators and round-robin cycling."
+---
+
+Fairness queuing prevents resource starvation in multi-producer scenarios. When enabled, Broccoli routes messages from different producers into separate sub-queues and cycles through them fairly, ensuring no single producer dominates consumer attention. This is essential for multi-tenant systems, per-user rate limiting, and priority partitioning.
+
+## The Problem: Producer Starvation
+
+Without fairness, a high-volume producer can flood the queue, starving low-volume producers:
+
+```
+Without Fairness:
+Queue: [User-A msg 1] [User-A msg 2] ... [User-A msg 100] [User-B msg 1]
+                     ↑ User-B's single message buried under User-A's 100 messages
+```
+
+Consumers process User-A's messages exclusively, delaying User-B indefinitely.
+
+## How Fairness Works
+
+**Enable fairness by providing a `disambiguator`** when publishing messages:
+
+```rust
+// Messages from different users get routed to separate queues
+queue.publish(
+    "notifications",
+    Some("user-123".to_string()),  // Disambiguator
+    &message,
+    None,
+).await?;
+
+queue.publish(
+    "notifications",
+    Some("user-456".to_string()),  // Different disambiguator
+    &message,
+    None,
+).await?;
+```
+
+Broccoli creates per-disambiguator sub-queues:
+
+```
+{topic}_{disambiguator}_queue    // e.g., notifications_user-123_queue
+{topic}_{disambiguator}_queue    // e.g., notifications_user-456_queue
+```
+
+When consuming with fairness enabled, Broccoli **round-robins** across all active disambiguators:
+
+```rust
+let consume_opts = ConsumeOptionsBuilder::new()
+    .fairness(true)
+    .build();
+
+let msg1 = queue.consume("notifications", Some(consume_opts.clone())).await?;
+// msg1 from user-123
+
+let msg2 = queue.consume("notifications", Some(consume_opts.clone())).await?;
+// msg2 from user-456
+
+let msg3 = queue.consume("notifications", Some(consume_opts.clone())).await?;
+// msg3 from user-123 (cycle repeats)
+```
+
+Result:
+
+```
+With Fairness:
+Queue 1 (user-123): [msg 1] → [msg 2] → [msg 3] ...
+Queue 2 (user-456): [msg 1] → [msg 2] → [msg 3] ...
+                    ↓         ↓         ↓
+Consumption: [user-123] → [user-456] → [user-123] → [user-456] ...
+```
+
+Each user gets equal consumer time.
+
+## Publishing with Disambiguator
+
+### Single Message
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize)]
+struct JobPayload {
+    work: String,
+}
+
+let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+// Publish with disambiguator
+let published = queue.publish(
+    "jobs",
+    Some("tenant-abc".to_string()),  // Disambiguator
+    &JobPayload {
+        work: "Process data".to_string(),
+    },
+    None,
+).await?;
+
+println!("Published to queue: jobs_tenant-abc_queue");
+println!("Message ID: {}", published.task_id);
+```
+
+### Batch Publishing
+
+```rust
+let payloads = vec![
+    JobPayload { work: "Task 1".to_string() },
+    JobPayload { work: "Task 2".to_string() },
+];
+
+let published = queue.publish_batch(
+    "jobs",
+    Some("tenant-xyz".to_string()),
+    payloads,
+    None,
+).await?;
+
+println!("Published {} messages to jobs_tenant-xyz_queue", published.len());
+```
+
+All messages in the batch use the same disambiguator.
+
+## Consuming with Fairness
+
+Enable fairness using `ConsumeOptionsBuilder`:
+
+```rust
+use broccoli_queue::queue::ConsumeOptionsBuilder;
+
+// Build fairness options
+let consume_opts = ConsumeOptionsBuilder::new()
+    .fairness(true)
+    .build();
+
+// Fairness consumes from round-robin sub-queues
+let msg = queue.consume::<JobPayload>("jobs", Some(consume_opts)).await?;
+println!("Disambiguator: {:?}", msg.disambiguator);
+```
+
+### Combining with Other Options
+
+```rust
+let consume_opts = ConsumeOptionsBuilder::new()
+    .fairness(true)
+    .auto_ack(true)
+    .consume_wait(std::time::Duration::from_millis(10))
+    .build();
+
+let msg = queue.consume::<JobPayload>("jobs", Some(consume_opts)).await?;
+```
+
+## Internal Fairness Data Structures
+
+When you publish with a disambiguator, Broccoli creates:
+
+```
+{topic}_fairness_set          // Set of all active disambiguators
+{topic}_fairness_round_robin  // List tracking current position
+{topic}_{disambiguator}_queue        // Sorted queue for this disambiguator
+{topic}_{disambiguator}_processing   // Processing queue
+{topic}_{disambiguator}_failed       // Failed queue
+```
+
+Example for topic="jobs":
+
+```
+jobs_fairness_set              // Contains: "tenant-abc", "tenant-xyz", ...
+jobs_fairness_round_robin      // Current index: 0, 1, 2, ...
+jobs_tenant-abc_queue          // [msg1, msg2, msg3]
+jobs_tenant-xyz_queue          // [msg1, msg2]
+jobs_tenant-abc_processing     // []
+jobs_tenant-xyz_processing     // []
+```
+
+## Fairness Feature Flag
+
+Fairness queuing is gated behind the `test-fairness` feature flag for testing:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.1", features = ["redis", "test-fairness"] }
+```
+
+<Info>
+Only the **Redis broker** currently supports fairness queuing. RabbitMQ and SurrealDB do not have fairness support yet.
+</Info>
+
+## Use Cases
+
+### 1. Multi-Tenant Job Processing
+
+Prevent one tenant from monopolizing worker resources:
+
+```rust
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct DataExportJob {
+    tenant_id: String,
+    query: String,
+    format: String,
+}
+
+// Publish from different tenants
+queue.publish(
+    "exports",
+    Some(job.tenant_id.clone()),
+    &job,
+    None,
+).await?;
+
+// Consumer cycles fairly across tenants
+let consume_opts = ConsumeOptionsBuilder::new().fairness(true).build();
+
+while let Ok(job) = queue.consume::<DataExportJob>("exports", Some(consume_opts.clone())).await {
+    // Each tenant gets equal processing time
+    process_export(&job).await.ok();
+    queue.acknowledge("exports", job).await.ok();
+}
+```
+
+### 2. Per-User Rate Limiting
+
+Ensure users don't overwhelm the system collectively:
+
+```rust
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ApiRequest {
+    endpoint: String,
+    params: serde_json::Value,
+}
+
+// Each user's requests go to a separate queue
+queue.publish(
+    "api_requests",
+    Some(user_id.clone()),
+    &request,
+    None,
+).await?;
+
+// Worker processes fairly across all users
+let consume_opts = ConsumeOptionsBuilder::new().fairness(true).build();
+
+loop {
+    if let Ok(req) = queue.try_consume::<ApiRequest>(
+        "api_requests",
+        Some(consume_opts.clone())
+    ).await {
+        if let Some(req) = req {
+            handle_request(&req).await.ok();
+            queue.acknowledge("api_requests", req).await.ok();
+        }
+    }
+}
+```
+
+### 3. Priority Partitioning
+
+Split work by priority while maintaining fairness within each priority:
+
+```rust
+// High-priority queue
+queue.publish(
+    "tasks_high",
+    Some(customer_id.clone()),
+    &task,
+    None,
+).await?;
+
+// Low-priority queue
+queue.publish(
+    "tasks_low",
+    Some(customer_id.clone()),
+    &task,
+    None,
+).await?;
+
+// Consume high-priority fairly across customers
+let high_consume_opts = ConsumeOptionsBuilder::new().fairness(true).build();
+let high_result = queue.try_consume::<Task>("tasks_high", Some(high_consume_opts)).await?;
+
+// If no high-priority work, consume low-priority fairly
+if high_result.is_none() {
+    let low_consume_opts = ConsumeOptionsBuilder::new().fairness(true).build();
+    queue.try_consume::<Task>("tasks_low", Some(low_consume_opts)).await?;
+}
+```
+
+## Complete Example: Multi-Tenant Job Queue
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, ConsumeOptionsBuilder};
+use serde::{Deserialize, Serialize};
+use std::error::Error;
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+struct WorkItem {
+    job_id: String,
+    tenant_id: String,
+    description: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(10)
+        .build()
+        .await?;
+
+    // Producer: Simulate messages from multiple tenants
+    let producer = {
+        let q = queue.clone();
+        tokio::spawn(async move {
+            for i in 0..20 {
+                let tenant = if i % 2 == 0 { "tenant-a" } else { "tenant-b" };
+                let work = WorkItem {
+                    job_id: format!("job-{}", i),
+                    tenant_id: tenant.to_string(),
+                    description: format!("Work item {} from {}", i, tenant),
+                };
+
+                q.publish(
+                    "work",
+                    Some(tenant.to_string()),
+                    &work,
+                    None,
+                )
+                .await
+                .ok();
+
+                println!("Published: {}", work.description);
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+    };
+
+    // Consumer: Process with fairness
+    let consumer = {
+        let q = queue.clone();
+        tokio::spawn(async move {
+            let consume_opts = ConsumeOptionsBuilder::new()
+                .fairness(true)
+                .build();
+
+            for _ in 0..20 {
+                if let Ok(work) = q.consume::<WorkItem>("work", Some(consume_opts.clone())).await {
+                    println!("Consumed: {} (tenant: {})", work.job_id, work.tenant_id);
+                    // Process work
+                    q.acknowledge("work", work).await.ok();
+                }
+            }
+        })
+    };
+
+    // Wait for both tasks
+    let _ = tokio::join!(producer, consumer);
+
+    Ok(())
+}
+```
+
+Output:
+```
+Published: Work item 0 from tenant-a
+Published: Work item 1 from tenant-b
+Published: Work item 2 from tenant-a
+...
+Consumed: job-0 (tenant: tenant-a)
+Consumed: job-1 (tenant: tenant-b)
+Consumed: job-2 (tenant: tenant-a)
+Consumed: job-3 (tenant: tenant-b)
+...
+```
+
+Consumption alternates fairly between tenants despite A having more messages initially.
+
+## Limitations
+
+- **Redis only** — RabbitMQ and SurrealDB don't support fairness yet
+- **Single consumer optimization** — Designed for single-threaded consumer pattern; concurrent consumers may not maintain perfect fairness
+- **Dynamic disambiguators** — New disambiguators are added to the rotation immediately; removed disambiguators are dropped when their queues empty
+
+## Fairness Without Disambiguator
+
+Fairness is optional. If you don't provide a disambiguator:
+
+```rust
+queue.publish("work", None, &payload, None).await?;  // No disambiguator
+
+// Consume without fairness (default unfair mode)
+let msg = queue.consume("work", None).await?;
+```
+
+Messages use the standard queue (`{topic}`), and no fairness tracking occurs.
+
+## Key Characteristics
+
+<CardGroup cols={2}>
+  <Card title="Round-Robin" icon="rotate-cw">
+    Cycles through disambiguators ensuring equal attention.
+  </Card>
+  <Card title="Optional" icon="toggle-left">
+    Enable per-consume operation, no per-queue commitment.
+  </Card>
+  <Card title="Redis Only" icon="database">
+    Currently supported on Redis broker only.
+  </Card>
+  <Card title="Zero-Config" icon="gear">
+    No setup needed — just provide a disambiguator and enable fairness.
+  </Card>
+</CardGroup>
+
+## What's Next?
+
+- **[Queue](/concepts/queue)** — Main API and lifecycle
+- **[Messages](/concepts/messages)** — Payload and disambiguator field
+- **[Brokers](/concepts/brokers)** — Redis fairness backend details
+- **[Retry Strategy](/concepts/retry-strategy)** — Failed message handling

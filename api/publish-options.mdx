@@ -1,0 +1,434 @@
+---
+title: "PublishOptions — Message Publishing Configuration"
+sidebarTitle: "PublishOptions"
+description: "Configure message TTL, priority, delay, and scheduling when publishing to message queues."
+---
+
+`PublishOptions` struct and `PublishOptionsBuilder` allow you to configure message delivery behavior when publishing, including message priority, time-to-live, and delayed/scheduled delivery.
+
+## Struct Definition
+
+```rust
+pub struct PublishOptions {
+    pub ttl: Option<Duration>,
+    pub priority: Option<u8>,
+    pub delay: Option<Duration>,
+    pub scheduled_at: Option<OffsetDateTime>,
+}
+```
+
+<ResponseField name="ttl" type="Option<Duration>">
+Time-to-live for the message. If set, the message expires after this duration from publish time. When a message expires, it is automatically removed from the queue without being processed.
+
+**Default:** `None` (no expiration)
+
+**Broker behavior:**
+- **Redis:** TTL is approximate; expired messages are cleaned up periodically.
+- **RabbitMQ:** Uses TTL headers; expired messages go to the dead-letter queue if configured.
+- **SurrealDB:** TTL is checked on consume; expired messages are skipped.
+</ResponseField>
+
+<ResponseField name="priority" type="Option<u8>">
+Message priority level, where `1` is highest and `5` is lowest.
+
+**Valid range:** 1–5 (inclusive)
+
+**Default:** `None` (treated as priority 5 / lowest)
+
+**Note:** Priority support is broker-dependent. RabbitMQ and SurrealDB support priority queues; Redis distributes messages FIFO but respects priority during consumption if fairness is enabled.
+
+**Panics:** Using `.priority(n)` with `n < 1` or `n > 5` will panic at runtime.
+</ResponseField>
+
+<ResponseField name="delay" type="Option<Duration>">
+Delay before the message becomes available for consumption. The message is published immediately but held in a delay queue until `now + delay`, at which point it moves to the main queue.
+
+**Default:** `None` (no delay)
+
+**Requires:** `enable_scheduling(true)` on the builder. If scheduling is not enabled, this field is ignored.
+
+**Broker-specific:**
+- **Redis:** Uses sorted sets with timestamp scores.
+- **RabbitMQ:** Requires the [delayed-exchange plugin](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq).
+- **SurrealDB:** Stored in a scheduled table; messages move to main queue on timeout.
+
+**Note:** `delay` and `scheduled_at` are mutually exclusive in intent. Use one or the other, not both.
+</ResponseField>
+
+<ResponseField name="scheduled_at" type="Option<OffsetDateTime>">
+Absolute timestamp when the message should become available. The message is held until this time, then moves to the main queue.
+
+**Default:** `None` (no scheduling)
+
+**Requires:** `enable_scheduling(true)` on the builder.
+
+**Note:** Uses absolute time, so ensure your system clock is accurate. If `scheduled_at` is in the past, the message becomes available immediately.
+
+**Note:** `delay` and `scheduled_at` are mutually exclusive in intent. Provide one or the other, not both.
+</ResponseField>
+
+## Builder Interface
+
+### Construction
+
+```rust
+impl PublishOptions {
+    pub const fn builder() -> PublishOptionsBuilder
+}
+
+impl PublishOptionsBuilder {
+    pub const fn new() -> Self
+}
+```
+
+### Builder Methods
+
+```rust
+pub struct PublishOptionsBuilder {
+    ttl: Option<Duration>,
+    priority: Option<u8>,
+    delay: Option<Duration>,
+    scheduled_at: Option<OffsetDateTime>,
+}
+```
+
+#### `ttl`
+
+Sets the time-to-live duration.
+
+```rust
+pub const fn ttl(mut self, duration: Duration) -> Self
+```
+
+<ParamField path="duration" type="Duration">
+The TTL duration from publish time.
+</ParamField>
+
+**Returns:** `Self` for method chaining.
+
+<CodeGroup>
+```rust
+PublishOptions::builder()
+    .ttl(Duration::seconds(3600))  // 1 hour
+    .build()
+```
+
+```rust
+PublishOptions::builder()
+    .ttl(Duration::minutes(30))
+    .build()
+```
+</CodeGroup>
+
+#### `priority`
+
+Sets the message priority (1–5, where 1 is highest).
+
+```rust
+pub fn priority(mut self, priority: u8) -> Self
+```
+
+<ParamField path="priority" type="u8">
+Priority level from 1 (highest) to 5 (lowest).
+</ParamField>
+
+**Returns:** `Self` for method chaining.
+
+**Panics:** If `priority` is not in range 1–5.
+
+<CodeGroup>
+```rust High Priority
+PublishOptions::builder()
+    .priority(1)
+    .build()
+```
+
+```rust Low Priority
+PublishOptions::builder()
+    .priority(5)
+    .build()
+```
+
+```rust Invalid Priority (panics)
+PublishOptions::builder()
+    .priority(6)  // Panic!
+    .build()
+```
+</CodeGroup>
+
+#### `delay`
+
+Sets a delay before message availability.
+
+```rust
+pub const fn delay(mut self, duration: Duration) -> Self
+```
+
+<ParamField path="duration" type="Duration">
+How long to delay from publish time.
+</ParamField>
+
+**Returns:** `Self` for method chaining.
+
+**Requires:** `enable_scheduling(true)` on the queue builder.
+
+<CodeGroup>
+```rust Delay 30 Seconds
+PublishOptions::builder()
+    .delay(Duration::seconds(30))
+    .build()
+```
+
+```rust Delay 5 Minutes
+PublishOptions::builder()
+    .delay(Duration::minutes(5))
+    .build()
+```
+</CodeGroup>
+
+#### `schedule_at`
+
+Sets an absolute timestamp for message availability.
+
+```rust
+pub const fn schedule_at(mut self, time: OffsetDateTime) -> Self
+```
+
+<ParamField path="time" type="OffsetDateTime">
+The time when the message should become available.
+</ParamField>
+
+**Returns:** `Self` for method chaining.
+
+**Requires:** `enable_scheduling(true)` on the queue builder.
+
+<CodeGroup>
+```rust Schedule for Later Today
+use time::{OffsetDateTime, Duration};
+
+let tomorrow = OffsetDateTime::now_utc() + Duration::days(1);
+
+PublishOptions::builder()
+    .schedule_at(tomorrow)
+    .build()
+```
+
+```rust Schedule Using Chrono (convert to time crate)
+let scheduled_time = chrono::Utc::now() + chrono::Duration::hours(2);
+let offset_time = time::OffsetDateTime::from_unix_timestamp(scheduled_time.timestamp())?;
+
+PublishOptions::builder()
+    .schedule_at(offset_time)
+    .build()
+```
+</CodeGroup>
+
+#### `build`
+
+Builds the `PublishOptions` struct.
+
+```rust
+pub const fn build(self) -> PublishOptions
+```
+
+**Returns:** `PublishOptions`
+
+<CodeGroup>
+```rust
+let options = PublishOptions::builder()
+    .ttl(Duration::minutes(30))
+    .priority(2)
+    .build();
+```
+</CodeGroup>
+
+## Struct Literal vs Builder
+
+You can construct `PublishOptions` as a struct literal or using the builder. The builder is more ergonomic for complex configurations.
+
+<CodeGroup>
+```rust Struct Literal
+use broccoli_queue::queue::PublishOptions;
+use time::Duration;
+
+let options = PublishOptions {
+    ttl: Some(Duration::seconds(3600)),
+    priority: Some(2),
+    delay: None,
+    scheduled_at: None,
+};
+```
+
+```rust Builder Pattern
+let options = PublishOptions::builder()
+    .ttl(Duration::seconds(3600))
+    .priority(2)
+    .build();
+```
+</CodeGroup>
+
+## Usage Examples
+
+### Basic Publishing with Options
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use time::Duration;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Event {
+    id: String,
+    data: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+    let event = Event {
+        id: "evt-1".into(),
+        data: "important".into(),
+    };
+
+    // Publish with 1-hour TTL and high priority
+    let message = queue.publish(
+        "events",
+        None,
+        &event,
+        Some(PublishOptions::builder()
+            .ttl(Duration::seconds(3600))
+            .priority(1)
+            .build())
+    ).await?;
+
+    println!("Published with ID: {}", message.task_id);
+    Ok(())
+}
+```
+
+### Delayed Message Publishing
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .enable_scheduling(true)  // Enable scheduling
+        .build()
+        .await?;
+
+    let event = /* ... */;
+
+    // Publish with 30-second delay
+    queue.publish(
+        "events",
+        None,
+        &event,
+        Some(PublishOptions::builder()
+            .delay(Duration::seconds(30))
+            .build())
+    ).await?;
+
+    println!("Message will be available in 30 seconds");
+    Ok(())
+}
+```
+
+### Scheduled Message Publishing
+
+```rust
+use broccoli_queue::queue::PublishOptions;
+use time::{OffsetDateTime, Duration};
+
+let two_hours_from_now = OffsetDateTime::now_utc() + Duration::hours(2);
+
+let options = PublishOptions::builder()
+    .schedule_at(two_hours_from_now)
+    .ttl(Duration::hours(24))
+    .build();
+
+queue.publish("events", None, &event, Some(options)).await?;
+```
+
+### Batch Publishing with Options
+
+```rust
+let events = vec![
+    Event { id: "1".into(), data: "high".into() },
+    Event { id: "2".into(), data: "low".into() },
+];
+
+let options = Some(PublishOptions::builder()
+    .priority(2)
+    .ttl(Duration::minutes(30))
+    .build());
+
+let published = queue.publish_batch(
+    "events",
+    None,
+    events,
+    options
+).await?;
+
+println!("Published {} events", published.len());
+```
+
+## Important Notes
+
+### Delay vs Scheduled At
+
+Both `delay` and `scheduled_at` achieve delayed delivery, but they differ:
+
+| Feature | `delay` | `scheduled_at` |
+| --- | --- | --- |
+| **Type** | Relative duration | Absolute timestamp |
+| **Use case** | "deliver in 30 seconds" | "deliver at 3 PM UTC" |
+| **Clock dependency** | Relative, no clock sync needed | Absolute, requires accurate system clock |
+
+Use `delay` for simple relative delays; use `scheduled_at` for absolute scheduling.
+
+### Scheduling Requirement
+
+Both delay and scheduled messages require **`enable_scheduling(true)`** on the queue builder:
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .enable_scheduling(true)  // REQUIRED for delay/scheduled_at
+    .build()
+    .await?;
+```
+
+Without it, delay and scheduled_at fields are silently ignored, and messages are published immediately.
+
+### RabbitMQ Scheduling Plugin
+
+If using RabbitMQ with `enable_scheduling(true)`, install the [delayed-exchange plugin](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq):
+
+```bash
+rabbitmq-plugins enable rabbitmq_delayed_message_exchange
+```
+
+### TTL and Dead Letters
+
+- **TTL expiration** is broker-dependent. Redis treats it as approximate; RabbitMQ can route expired messages to a dead-letter queue if configured.
+- **No error on expiration.** Messages silently expire and are not reported back to the publisher.
+
+### Priority Behavior
+
+- Priority is advisory; brokers may not strictly enforce it under high load.
+- Some brokers (like Redis) implement priority through fair distribution; higher-priority messages are more likely to be consumed first.
+- Always set a priority if message importance varies; don't rely on it alone for ordering.
+
+## Default Values
+
+When `PublishOptions::default()` is used or fields are `None`:
+
+| Field | Default |
+| --- | --- |
+| `ttl` | `None` (no expiration) |
+| `priority` | `None` (treated as 5 / lowest) |
+| `delay` | `None` (immediate) |
+| `scheduled_at` | `None` (immediate) |

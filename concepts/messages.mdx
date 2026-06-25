@@ -1,0 +1,358 @@
+---
+title: "Messages: Payload Wrappers with Lifecycle Tracking"
+sidebarTitle: "Messages"
+description: "Explore BrokerMessage structure, payload serialization, message identity with UUIDs, and state tracking."
+---
+
+Every message in Broccoli is wrapped in a `BrokerMessage<T>` envelope that pairs your payload with metadata for lifecycle tracking. This structure ensures each message can be uniquely identified, retried correctly, and routed fairly across consumers.
+
+## BrokerMessage Structure
+
+`BrokerMessage<T>` is a generic wrapper around your payload:
+
+```rust
+pub struct BrokerMessage<T: Clone> {
+    pub task_id: uuid::Uuid,                      // Unique UUID v4 identifier
+    pub payload: T,                                // Your message data
+    pub attempts: u8,                              // Number of retry attempts made
+    pub disambiguator: Option<String>,             // Optional fairness key
+    pub metadata: Option<HashMap<String, MetadataTypes>>,  // Internal metadata
+}
+```
+
+### Field Breakdown
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `task_id` | `uuid::Uuid` | Unique identifier, auto-generated as UUID v4 on publish |
+| `payload` | `T` | Your custom message type (must implement `Clone + Serialize + DeserializeOwned`) |
+| `attempts` | `u8` | Counter for retry attempts, starts at 0 |
+| `disambiguator` | `Option<String>` | Optional key for fairness routing (e.g., tenant ID, user ID) |
+| `metadata` | `Option<HashMap>` | Internal state for priority, TTL, etc. |
+
+## Payload Type Requirements
+
+Your payload type `T` must satisfy these trait bounds:
+
+```rust
+T: Clone + serde::Serialize + serde::de::DeserializeOwned
+```
+
+This allows Broccoli to:
+- Clone messages within the queue system
+- Serialize to JSON for broker storage
+- Deserialize back to your type when consuming
+
+### Defining a Payload Struct
+
+Use `#[derive]` macros for automatic trait implementations:
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct EmailPayload {
+    pub recipient: String,
+    pub subject: String,
+    pub body: String,
+    pub priority: u8,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct JobPayload {
+    pub job_id: String,
+    pub parameters: serde_json::Value,
+    pub timeout_seconds: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct WebhookPayload {
+    pub event_type: String,
+    pub user_id: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub data: serde_json::json::Value,
+}
+```
+
+<Info>
+Broccoli uses `serde_json` internally for serialization. Complex nested types work as long as they're JSON-serializable.
+</Info>
+
+## Message Identity: Task ID
+
+Each message receives a unique `task_id` when published:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+let message = EmailPayload {
+    recipient: "user@example.com".to_string(),
+    subject: "Welcome!".to_string(),
+    body: "Thanks for signing up.".to_string(),
+    priority: 1,
+};
+
+let published = queue.publish("emails", None, &message, None).await?;
+
+// task_id is a UUID v4, auto-generated
+println!("Message ID: {}", published.task_id);
+// Output: Message ID: 550e8400-e29b-41d4-a716-446655440000
+```
+
+The `task_id` is:
+- **Globally unique** — UUID v4 ensures no collisions
+- **Immutable** — Same across retries and state transitions
+- **Traceable** — Use it to correlate logs, metrics, and monitoring
+- **Auto-generated** — No need to provide your own
+
+## Message States
+
+A message transitions through states as it moves through the queue:
+
+<Steps>
+  <Step title="Queued">
+    Message published and waiting to be consumed. Stored in `{topic}` or `{topic}_{disambiguator}_queue`.
+  </Step>
+  <Step title="Processing">
+    Message consumed but not yet acknowledged or rejected. Stored in `{topic}_processing` or `{topic}_{disambiguator}_processing` to prevent loss if the consumer crashes.
+  </Step>
+  <Step title="Acknowledged">
+    Message successfully processed and removed from all queues.
+  </Step>
+  <Step title="Retrying">
+    Message rejected during processing. If retries remain, it returns to the main queue with `attempts` incremented.
+  </Step>
+  <Step title="Failed">
+    Message exhausted all retry attempts or `retry_failed` is `false`. Moved to `{topic}_failed` or `{topic}_{disambiguator}_failed`.
+  </Step>
+</Steps>
+
+### Tracking Attempts
+
+The `attempts` counter tracks how many times a message has been processed:
+
+```rust
+// Consumer receives a message
+let msg = queue.consume::<EmailPayload>("emails", None).await?;
+
+match process_email(&msg.payload).await {
+    Ok(_) => {
+        // Success
+        queue.acknowledge("emails", msg).await?;
+    }
+    Err(e) => {
+        // Failure — message will be retried
+        println!("Attempt {} failed: {}", msg.attempts, e);
+        queue.reject("emails", msg).await?;
+    }
+}
+```
+
+When you reject a message, Broccoli:
+1. Increments `attempts`
+2. If `attempts < max_retries`, re-queues the message
+3. Otherwise, moves to the failed queue
+
+## Publishing Messages
+
+### Single Message
+
+```rust
+let published = queue.publish("topic", disambiguator, &payload, options).await?;
+
+// Access published message data
+println!("Task ID: {}", published.task_id);
+println!("Initial attempts: {}", published.attempts);  // Always 0
+```
+
+### Batch Publishing
+
+Publish multiple messages efficiently:
+
+```rust
+let payloads = vec![
+    EmailPayload { /* ... */ },
+    EmailPayload { /* ... */ },
+    EmailPayload { /* ... */ },
+];
+
+let published = queue
+    .publish_batch("emails", None, payloads, None)
+    .await?;
+
+println!("Published {} messages", published.len());
+```
+
+Each message in the batch gets its own unique `task_id`.
+
+## Message Lifecycle Example
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, ConsumeOptionsBuilder};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+struct TaskPayload {
+    task_id: String,
+    work: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+    // Publish
+    let payload = TaskPayload {
+        task_id: "task-1".to_string(),
+        work: "Process data".to_string(),
+    };
+    
+    let published = queue
+        .publish("tasks", None, &payload, None)
+        .await?;
+
+    println!("Published: task_id={}", published.task_id);
+    // Output: Published: task_id=123e4567-e89b-12d3-a456-426614174000
+
+    // Consume
+    let consumed = queue
+        .consume::<TaskPayload>("tasks", None)
+        .await?;
+
+    assert_eq!(published.task_id, consumed.task_id);
+    assert_eq!(consumed.attempts, 0);
+    assert_eq!(consumed.payload.work, "Process data");
+
+    // Simulate processing failure
+    if let Err(_) = process_task(&consumed.payload).await {
+        println!("Processing failed, rejecting (attempt: {})", consumed.attempts);
+        queue.reject("tasks", consumed.clone()).await?;
+
+        // Message is now in retry queue. Next consume will get it with attempts=1
+        let retried = queue
+            .consume::<TaskPayload>("tasks", None)
+            .await?;
+        
+        assert_eq!(retried.attempts, 1);
+        assert_eq!(retried.task_id, published.task_id);
+    }
+
+    Ok(())
+}
+
+async fn process_task(payload: &TaskPayload) -> Result<(), String> {
+    // Simulate work
+    Err("Processing failed".to_string())
+}
+```
+
+## Disambiguator for Fairness
+
+The optional `disambiguator` field enables fair queue routing:
+
+```rust
+// Publish messages from different users with disambiguator
+queue
+    .publish(
+        "notifications",
+        Some("user-123".to_string()),  // Disambiguator
+        &message,
+        None,
+    )
+    .await?;
+
+queue
+    .publish(
+        "notifications",
+        Some("user-456".to_string()),  // Different disambiguator
+        &message,
+        None,
+    )
+    .await?;
+
+// Consume with fairness enabled
+let consume_opts = ConsumeOptionsBuilder::new()
+    .fairness(true)
+    .build();
+
+let msg1 = queue
+    .consume::<Notification>("notifications", Some(consume_opts.clone()))
+    .await?;
+// Will alternate between users
+
+assert_eq!(msg1.disambiguator, Some("user-123".to_string()));
+```
+
+Messages with the same `disambiguator` are grouped together, and consumers rotate through groups fairly. See [Fairness](/concepts/fairness) for details.
+
+## Internal vs. Public Messages
+
+Broccoli has two message types:
+
+| Type | Use Case |
+|------|----------|
+| `BrokerMessage<T>` | Public API — what you publish and consume |
+| `InternalBrokerMessage` | Internal — JSON representation in broker storage |
+
+You only work with `BrokerMessage<T>`. The internal type is an implementation detail that serializes your payload to JSON strings for storage.
+
+## Key Characteristics
+
+<CardGroup cols={2}>
+  <Card title="Type Safe" icon="shield-check">
+    Payloads are generic and type-checked at compile time.
+  </Card>
+  <Card title="UUID Identity" icon="key">
+    Every message gets a unique, traceable UUID v4.
+  </Card>
+  <Card title="Retry Tracking" icon="repeat">
+    Automatic attempt counting for intelligent retry logic.
+  </Card>
+  <Card title="JSON Serialization" icon="brackets-curly">
+    Payloads are stored as JSON, compatible with any broker.
+  </Card>
+</CardGroup>
+
+## Common Patterns
+
+### Request-Response with Task ID
+
+```rust
+// Store task_id for later correlation
+let published = queue.publish("tasks", None, &payload, None).await?;
+let request_id = published.task_id;
+
+// Later: look up results by task_id
+let task = fetch_task_result(request_id).await?;
+```
+
+### Per-Tenant Queuing
+
+```rust
+// Disambiguator as tenant ID ensures fair resource allocation
+queue.publish(
+    "jobs",
+    Some(tenant_id.to_string()),
+    &job_payload,
+    None,
+).await?;
+```
+
+### Retry Backoff Logging
+
+```rust
+// Log each attempt for debugging
+let msg = queue.consume::<Task>("tasks", None).await?;
+if msg.attempts > 0 {
+    eprintln!("Retry attempt {} for task {}", msg.attempts, msg.task_id);
+}
+```
+
+## What's Next?
+
+- **[Queue](/concepts/queue)** — Central coordinator and lifecycle management
+- **[Brokers](/concepts/brokers)** — Backend storage and transport
+- **[Retry Strategy](/concepts/retry-strategy)** — Configure max attempts and retry behavior
+- **[Fairness](/concepts/fairness)** — Fair consumption across disambiguators

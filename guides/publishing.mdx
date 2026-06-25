@@ -1,0 +1,309 @@
+---
+title: Publishing Messages to the Queue
+sidebarTitle: Publishing
+description: Learn how to publish single and batch messages with priority, TTL, delay, and scheduling options using Broccoli Queue.
+---
+
+Publishing messages is the first step in using Broccoli Queue. The library provides flexible APIs for single message publishing, batch publishing, and scheduling messages for future delivery.
+
+## Publishing a Single Message
+
+Use the `publish()` method to send a single message to a topic. The message is immediately available for consumption unless you specify a delay or schedule time.
+
+<Tabs>
+<Tab title="Single Message">
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JobPayload {
+    id: String,
+    task_name: String,
+    parameters: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .build()
+        .await?;
+
+    let job = JobPayload {
+        id: "job-123".to_string(),
+        task_name: "process_data".to_string(),
+        parameters: "input.csv".to_string(),
+        created_at: chrono::Utc::now(),
+    };
+
+    let published = queue.publish(
+        "jobs",           // topic name
+        None,             // disambiguator (for fairness routing)
+        &job,             // message
+        None,             // publish options
+    ).await?;
+
+    println!("Published message with ID: {}", published.task_id);
+    Ok(())
+}
+```
+</Tab>
+<Tab title="With Options">
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use time::Duration;
+
+let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+let job = JobPayload { /* ... */ };
+
+let options = PublishOptions {
+    ttl: Some(Duration::hours(1)),
+    priority: Some(2),  // 1=highest, 5=lowest
+    delay: None,
+    scheduled_at: None,
+};
+
+let published = queue.publish(
+    "jobs",
+    None,
+    &job,
+    Some(options),
+).await?;
+```
+</Tab>
+</Tabs>
+
+The `publish()` method returns a `BrokerMessage<T>` containing:
+- **task_id**: A unique UUID assigned by the broker
+- **payload**: Your message data
+- **attempts**: Current retry attempt count (starts at 0)
+- **disambiguator**: The fairness routing key (if provided)
+
+## Publishing Multiple Messages in Batch
+
+For higher throughput, use `publish_batch()` to send multiple messages in a single operation:
+
+```rust
+let jobs = vec![
+    JobPayload {
+        id: "job-1".to_string(),
+        task_name: "task_a".to_string(),
+        parameters: "data1".to_string(),
+        created_at: chrono::Utc::now(),
+    },
+    JobPayload {
+        id: "job-2".to_string(),
+        task_name: "task_b".to_string(),
+        parameters: "data2".to_string(),
+        created_at: chrono::Utc::now(),
+    },
+];
+
+let published = queue.publish_batch(
+    "jobs",
+    None,
+    jobs,
+    None,
+).await?;
+
+println!("Published {} messages", published.len());
+for msg in published {
+    println!("  - Message ID: {}", msg.task_id);
+}
+```
+
+Batch publishing is more efficient than looping single publishes, especially when dealing with hundreds of messages.
+
+## Using PublishOptions
+
+Control message behavior with `PublishOptions`:
+
+<CardGroup cols={2}>
+<Card title="TTL (Time-to-Live)" icon="hourglass">
+Set an expiration time for your message. After the TTL expires, the message is automatically removed.
+
+```rust
+PublishOptions {
+    ttl: Some(Duration::hours(2)),
+    ..Default::default()
+}
+```
+</Card>
+
+<Card title="Priority (1-5)" icon="arrow-up">
+Higher priority messages (1=highest, 5=lowest) are consumed before lower priority ones.
+
+```rust
+PublishOptions {
+    priority: Some(1),  // Highest priority
+    ..Default::default()
+}
+```
+</Card>
+
+<Card title="Delay" icon="clock">
+Delay message availability by a relative duration from now.
+
+```rust
+PublishOptions {
+    delay: Some(Duration::seconds(30)),
+    ..Default::default()
+}
+```
+</Card>
+
+<Card title="Scheduled Time" icon="calendar">
+Schedule a message for an absolute future time using OffsetDateTime.
+
+```rust
+let scheduled = time::OffsetDateTime::now_utc() 
+    + time::Duration::hours(2);
+
+PublishOptions {
+    scheduled_at: Some(scheduled),
+    ..Default::default()
+}
+```
+</Card>
+</CardGroup>
+
+### Using the PublishOptionsBuilder
+
+For a fluent API, use the builder pattern:
+
+```rust
+let options = PublishOptions::builder()
+    .ttl(Duration::hours(24))
+    .priority(3)
+    .delay(Duration::minutes(5))
+    .build();
+
+let published = queue.publish("jobs", None, &job, Some(options)).await?;
+```
+
+## Message Fairness and Disambiguators
+
+The optional `disambiguator` parameter routes messages to fairness-aware queues. When enabled on the queue, messages with different disambiguators are distributed fairly across consumers:
+
+```rust
+// Route messages by customer ID for fair distribution
+queue.publish(
+    "notifications",
+    Some("customer-456".to_string()),  // disambiguator
+    &notification,
+    None,
+).await?;
+
+// Another customer's messages go to a separate fair queue
+queue.publish(
+    "notifications",
+    Some("customer-789".to_string()),  // different disambiguator
+    &notification,
+    None,
+).await?;
+```
+
+<Tip>
+The disambiguator creates isolated queues per value, ensuring no single customer can starve others' messages from being processed.
+</Tip>
+
+## Complete Example: Scheduled Batch Publish
+
+Here's a practical example of publishing delayed jobs in batch:
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, PublishOptions};
+use time::Duration;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(5)
+        .build()
+        .await?;
+
+    // Publish jobs that should run 10 seconds from now
+    let scheduled_jobs = vec![
+        JobPayload {
+            id: "job-1".to_string(),
+            task_name: "process_data".to_string(),
+            parameters: "input.csv".to_string(),
+            created_at: chrono::Utc::now(),
+        },
+        JobPayload {
+            id: "job-2".to_string(),
+            task_name: "generate_report".to_string(),
+            parameters: "params.json".to_string(),
+            created_at: chrono::Utc::now(),
+        },
+    ];
+
+    let options = PublishOptions {
+        delay: Some(Duration::seconds(10)),
+        priority: Some(2),
+        ttl: Some(Duration::hours(1)),
+        scheduled_at: None,
+    };
+
+    let published = queue.publish_batch(
+        "jobs",
+        None,
+        scheduled_jobs,
+        Some(options),
+    ).await?;
+
+    println!("Scheduled {} jobs to run in 10 seconds", published.len());
+    for msg in published {
+        println!("  - Job {} (ID: {})", msg.payload.id, msg.task_id);
+    }
+
+    Ok(())
+}
+```
+
+## Best Practices
+
+<Steps>
+<Step title="Use batch publishing for throughput">
+When publishing many related messages, always use `publish_batch()` instead of looping `publish()` calls.
+</Step>
+
+<Step title="Set appropriate TTL values">
+Messages without TTL may accumulate indefinitely. Set realistic expiration times based on your use case.
+</Step>
+
+<Step title="Handle publish errors">
+Check for `BroccoliError::Publish` to catch serialization or broker connection failures.
+
+```rust
+match queue.publish("jobs", None, &job, None).await {
+    Ok(msg) => println!("Published: {}", msg.task_id),
+    Err(e) => eprintln!("Publish failed: {}", e),
+}
+```
+</Step>
+
+<Step title="Use disambiguators for fairness">
+When processing messages per customer/tenant, always provide a disambiguator to prevent starvation.
+</Step>
+
+<Step title="Keep payloads serializable">
+Ensure your message struct implements `serde::Serialize` and `serde::Deserialize` for all fields.
+</Step>
+</Steps>
+
+## Scheduling on RabbitMQ
+
+<Warning>
+If using RabbitMQ with scheduling (delay or scheduled_at), you must install the **rabbitmq_delayed_message_exchange** plugin. See [RabbitMQ scheduling plugin documentation](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) for installation steps. Enable scheduling during queue initialization:
+
+```rust
+let queue = BroccoliQueue::builder(rabbitmq_url)
+    .enable_scheduling(true)
+    .build()
+    .await?;
+```
+</Warning>

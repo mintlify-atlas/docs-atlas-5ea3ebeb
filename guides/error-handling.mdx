@@ -1,0 +1,400 @@
+---
+title: Error Handling and Retry Strategies
+sidebarTitle: Error Handling
+description: Handle message processing failures, manage the failed queue, and implement custom error strategies in Broccoli Queue.
+---
+
+Robust error handling is essential for reliable message queue systems. Broccoli Queue provides structured error types and flexible retry mechanisms to handle failures gracefully.
+
+## BroccoliError Enum
+
+All Broccoli operations return `Result<T, BroccoliError>`. The error enum covers all possible failure scenarios:
+
+<CardGroup cols={2}>
+<Card title="Operation Errors" icon="exclamation">
+- **Broker**: General broker connection or pool errors
+- **Publish**: Message serialization or publishing failures
+- **Consume**: Message retrieval or deserialization failures
+- **Acknowledge**: Ack processing failures
+- **Reject**: Rejection processing failures
+- **Cancel**: Message cancellation failures
+</Card>
+
+<Card title="Concurrency Errors" icon="shuffle">
+- **BrokerNonIdempotentOp**: Concurrent operation not idempotent (SurrealDB reads)
+- **BrokerNonIdempotentRetriableOp**: Concurrent operation that can be retried (SurrealDB writes)
+
+These only occur with SurrealDB broker when multiple parallel operations access the same table.
+</Card>
+
+<Card title="Utility Errors" icon="gear">
+- **GetMessagePosition**: Failed to retrieve message location in queue
+- **Serialization**: JSON serialization/deserialization failure
+- **Job**: Custom job processing error
+- **QueueStatus**: Failed to retrieve queue status (requires `management` feature)
+</Card>
+
+<Card title="Infrastructure Errors" icon="server">
+- **Redis**: Wrapped Redis-specific error (when `redis` feature enabled)
+- **SurrealDB**: Wrapped SurrealDB-specific error (when `surrealdb` feature enabled)
+- **ConnectionTimeout**: Connection failed after N retry attempts
+- **NotImplemented**: Feature not available on this broker
+</Card>
+</CardGroup>
+
+## Error Handling Patterns
+
+### Pattern 1: Try-Catch with Logging
+
+```rust
+use broccoli_queue::error::BroccoliError;
+
+match queue.publish("jobs", None, &job, None).await {
+    Ok(msg) => println!("Published: {}", msg.task_id),
+    Err(BroccoliError::Publish(e)) => {
+        eprintln!("Failed to publish message: {}", e);
+        // Could retry or send alert
+    }
+    Err(e) => eprintln!("Unexpected error: {}", e),
+}
+```
+
+### Pattern 2: Wrapping BroccoliError in Custom Error Type
+
+```rust
+use broccoli_queue::error::BroccoliError;
+
+#[derive(Debug)]
+pub enum JobError {
+    QueueError(BroccoliError),
+    ProcessingError(String),
+    ValidationError(String),
+}
+
+impl From<BroccoliError> for JobError {
+    fn from(err: BroccoliError) -> Self {
+        JobError::QueueError(err)
+    }
+}
+
+async fn publish_job(job: JobPayload) -> Result<String, JobError> {
+    // BroccoliError is automatically converted
+    let msg = queue.publish("jobs", None, &job, None).await?;
+    Ok(msg.task_id.to_string())
+}
+```
+
+### Pattern 3: Retry Logic
+
+```rust
+use broccoli_queue::error::BroccoliError;
+use std::time::Duration;
+
+async fn publish_with_retry(
+    queue: &BroccoliQueue,
+    job: &JobPayload,
+    max_retries: u32,
+) -> Result<String, BroccoliError> {
+    let mut retries = 0;
+    loop {
+        match queue.publish("jobs", None, job, None).await {
+            Ok(msg) => return Ok(msg.task_id.to_string()),
+            Err(e) if retries < max_retries => {
+                eprintln!("Publish failed, retrying: {}", e);
+                retries += 1;
+                tokio::time::sleep(Duration::from_millis(100 * retries as u64)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+```
+
+## Handling Connection Errors
+
+Connection errors are categorized as `BroccoliError::ConnectionTimeout` with the number of failed attempts:
+
+```rust
+match queue.consume::<JobPayload>("jobs", None).await {
+    Ok(msg) => process_message(msg).await,
+    Err(BroccoliError::ConnectionTimeout(attempts)) => {
+        eprintln!("Connection failed after {} attempts", attempts);
+        eprintln!("Check broker availability and network connectivity");
+    }
+    Err(e) => eprintln!("Error: {}", e),
+}
+```
+
+When you encounter connection timeouts:
+1. Verify the broker is running and accessible
+2. Check network connectivity
+3. Ensure the broker URL is correct
+4. Review firewall rules
+
+## Reject vs. Cancel
+
+When a message fails processing, choose between rejection and cancellation:
+
+| Operation | Behavior | Use Case |
+|-----------|----------|----------|
+| **Reject** | Increments retry counter; retries if attempts < limit, else moves to failed queue | Transient failures that might succeed on retry |
+| **Cancel** | Immediately removes message entirely | Messages that should never be retried (invalid format, etc.) |
+
+```rust
+let message = queue.consume::<JobPayload>("jobs", None).await?;
+
+match process_job(&message.payload).await {
+    Ok(()) => {
+        queue.acknowledge("jobs", message).await?;
+    }
+    Err(TransientError(e)) => {
+        // Might succeed on retry
+        println!("Temporary error, rejecting for retry: {}", e);
+        queue.reject("jobs", message).await?;
+    }
+    Err(PermanentError(e)) => {
+        // Will never succeed, cancel it
+        println!("Fatal error, canceling: {}", e);
+        queue.cancel("jobs", message.task_id.to_string()).await?;
+    }
+}
+```
+
+## The Failed Queue
+
+When a message exceeds its retry limit, it's moved to the **failed queue**, named `{topic}_failed`. Failed messages are preserved for inspection and manual intervention:
+
+```rust
+// Check the failed queue manually
+match queue.try_consume::<JobPayload>("jobs_failed", None).await? {
+    Some(failed_msg) => {
+        println!("Failed message attempts: {}", failed_msg.attempts);
+        println!("Payload: {:?}", failed_msg.payload);
+    }
+    None => println!("No failed messages"),
+}
+```
+
+### Configuring Retry Attempts
+
+During queue initialization, set max retry attempts:
+
+```rust
+use broccoli_queue::queue::RetryStrategy;
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(
+        RetryStrategy::new()
+            .with_attempts(5)      // Retry up to 5 times
+            .retry_failed(true)    // Enable retries
+    )
+    .build()
+    .await?;
+```
+
+Or disable retries entirely:
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(
+        RetryStrategy::new().retry_failed(false)  // No retries
+    )
+    .build()
+    .await?;
+```
+
+Messages that fail with `retry_failed(false)` go directly to the failed queue on first rejection.
+
+## Error Handling in process_messages_with_handlers
+
+Use the `on_error` callback for custom error handling in worker loops:
+
+```rust
+use broccoli_queue::error::BroccoliError;
+
+async fn my_error_handler(
+    msg: JobPayload,
+    error: BroccoliError,
+) -> Result<(), BroccoliError> {
+    match error {
+        BroccoliError::Consume(e) => {
+            eprintln!("Failed to consume: {}", e);
+            // Don't retry consumption errors
+        }
+        BroccoliError::Job(e) => {
+            eprintln!("Job failed: {}", e);
+            // Log for manual review
+        }
+        e => {
+            eprintln!("Unexpected error: {}", e);
+        }
+    }
+    Ok(())  // Error handler returning Ok means "handled"
+}
+
+queue.process_messages_with_handlers(
+    "jobs",
+    Some(4),
+    None,
+    |msg| async move { process_job(msg.payload).await },
+    |msg, _| async move { Ok(()) },  // on_success
+    my_error_handler,                // on_error
+).await?;
+```
+
+The `on_error` callback is called when message handling fails. Returning `Err()` from the callback stops the worker.
+
+## Handling SurrealDB Concurrency Errors
+
+When using SurrealDB, concurrent operations on the same data can fail with non-idempotent errors:
+
+```rust
+async fn handle_surreal_errors(
+    queue: &BroccoliQueue,
+) -> Result<(), BroccoliError> {
+    loop {
+        match queue.consume::<JobPayload>("jobs", None).await {
+            Ok(msg) => {
+                // Process normally
+                queue.acknowledge("jobs", msg).await?;
+            }
+            Err(BroccoliError::BrokerNonIdempotentOp(e)) => {
+                // Multiple concurrent reads on same table
+                println!("Concurrency conflict: {}", e);
+                // Reduce concurrency or wait
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            Err(BroccoliError::BrokerNonIdempotentRetriableOp(e)) => {
+                // Concurrent write that can be retried
+                println!("Retriable conflict: {}", e);
+                // Can retry immediately or with backoff
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+```
+
+## Best Practices
+
+<Steps>
+<Step title="Always handle errors explicitly">
+Don't swallow errors with `.unwrap()` or ignore them with `.ok()`. Log or take action.
+
+```rust
+// Bad
+let _ = queue.publish("jobs", None, &job, None).await;
+
+// Good
+match queue.publish("jobs", None, &job, None).await {
+    Ok(_) => println!("Published"),
+    Err(e) => eprintln!("Publish failed: {}", e),
+}
+```
+</Step>
+
+<Step title="Use custom error types for your application">
+Wrap `BroccoliError` in your domain-specific error type for cleaner error handling.
+
+```rust
+pub enum AppError {
+    Queue(BroccoliError),
+    Validation(String),
+    Database(String),
+}
+
+impl From<BroccoliError> for AppError {
+    fn from(err: BroccoliError) -> Self {
+        AppError::Queue(err)
+    }
+}
+```
+</Step>
+
+<Step title="Set appropriate retry limits">
+Too many retries = messages stuck indefinitely. Too few = legitimate transient failures lost.
+For most cases, 3-5 retries over a few seconds is reasonable.
+</Step>
+
+<Step title="Monitor the failed queue">
+Implement periodic checks of the failed queue. Failed messages indicate problems worth investigating.
+
+```rust
+#[tokio::task]
+async fn monitor_failed_queue(queue: Arc<BroccoliQueue>) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        
+        if let Ok(Some(_)) = queue.try_consume::<JobPayload>("jobs_failed", None).await {
+            eprintln!("ALERT: Messages in failed queue!");
+            // Send alert/metric
+        }
+    }
+}
+```
+</Step>
+
+<Step title="Distinguish transient from permanent failures">
+Only reject messages that might succeed on retry. Cancel messages with permanent issues (bad format, invalid input, etc).
+</Step>
+
+<Step title="Add timeouts to handlers">
+Prevent stuck handlers from accumulating:
+
+```rust
+let timeout = std::time::Duration::from_secs(30);
+tokio::time::timeout(timeout, process_job(&payload))
+    .await
+    .map_err(|_| BroccoliError::Job("Processing timeout".into()))?
+```
+</Step>
+
+<Step title="Log full error context">
+When logging errors, include the message ID, attempts, and any relevant metadata for debugging.
+
+```rust
+eprintln!(
+    "Message {} failed on attempt {}: {}",
+    msg.task_id,
+    msg.attempts,
+    error
+);
+```
+</Step>
+</Steps>
+
+## Error Reference
+
+```rust
+// Match on specific errors
+match result {
+    Err(BroccoliError::Broker(msg)) => {
+        // Broker connection/pool issue
+    }
+    Err(BroccoliError::Publish(msg)) => {
+        // Failed to publish (serialization or send failed)
+    }
+    Err(BroccoliError::Consume(msg)) => {
+        // Failed to consume (deserialization or receive failed)
+    }
+    Err(BroccoliError::Acknowledge(msg)) => {
+        // Failed to acknowledge message
+    }
+    Err(BroccoliError::Reject(msg)) => {
+        // Failed to reject message (may be retried)
+    }
+    Err(BroccoliError::Cancel(msg)) => {
+        // Failed to cancel message
+    }
+    Err(BroccoliError::ConnectionTimeout(attempts)) => {
+        // Connection failed after N attempts
+    }
+    Err(BroccoliError::NotImplemented) => {
+        // Feature not supported on this broker
+    }
+    Err(e) => {
+        // All other errors
+    }
+}
+```

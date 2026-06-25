@@ -1,0 +1,375 @@
+---
+title: 'Redis: High-Performance Default Backend'
+sidebarTitle: 'Redis'
+description: 'Complete guide to using Redis as your message queue broker. Supports fairness queuing, scheduling, and priority-based message delivery.'
+---
+
+Redis is the default and most feature-complete message broker backend for Broccoli Queue. It offers optimal performance for most use cases with built-in support for fairness queuing, message scheduling, and priority-based delivery.
+
+## Overview
+
+Redis provides a production-ready message queue implementation with the following characteristics:
+
+- **Default Backend**: Automatically enabled—no additional feature flags required
+- **Connection Pool**: Uses `bb8-redis` connection pooling for efficient resource management
+- **Feature Complete**: Supports all core messaging patterns including fairness queuing and scheduling
+- **High Performance**: Optimized for throughput with minimal latency
+- **Data Structure**: Messages stored as Redis hashes with sorted sets for queue ordering
+
+## Installation
+
+Redis is included by default in Broccoli Queue. If you're explicitly configuring features, ensure the `redis` feature is enabled:
+
+<CodeGroup>
+```toml Cargo.toml
+[dependencies]
+broccoli_queue = { version = "0.4", features = ["redis"] }
+```
+
+```toml Default (no features needed)
+[dependencies]
+broccoli_queue = "0.4"  # redis enabled by default
+```
+</CodeGroup>
+
+## Connection URLs
+
+Broccoli Queue supports multiple Redis URL schemes:
+
+<CodeGroup>
+```
+redis://localhost:6379
+```
+
+```
+redis://user:password@localhost:6379
+```
+
+```
+rediss://user:password@localhost:6379  # TLS
+```
+
+```
+redis+sentinel://
+```
+</CodeGroup>
+
+## Quick Start
+
+<Steps>
+  <Step title="Create a queue instance">
+    <CodeGroup>
+    ```rust Basic Setup
+    use broccoli_queue::{BroccoliQueue, brokers::broker::BrokerConfig};
+
+    #[tokio::main]
+    async fn main() -> Result<(), Box<dyn std::error::Error>> {
+        let queue = BroccoliQueue::builder("redis://localhost:6379")
+            .build::<String>()
+            .await?;
+        Ok(())
+    }
+    ```
+
+    ```rust With Configuration
+    use broccoli_queue::{BroccoliQueue, brokers::broker::BrokerConfig};
+
+    let config = BrokerConfig {
+        pool_connections: Some(20),
+        retry_attempts: Some(5),
+        retry_failed: Some(true),
+        enable_scheduling: Some(true),
+        #[cfg(feature = "surrealdb")]
+        surrealdb_connection: None,
+    };
+
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .with_broker_config(config)
+        .build::<String>()
+        .await?;
+    ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Publish a message">
+    ```rust
+    use broccoli_queue::queue::PublishOptions;
+    use std::time::Duration;
+
+    queue.publish("my_queue", "Hello, Redis!", None).await?;
+
+    // With priority and delay
+    queue.publish(
+        "my_queue",
+        "High priority task",
+        Some(PublishOptions {
+            priority: Some(1),  // 1 = highest
+            delay: Some(Duration::from_secs(10)),
+            ..Default::default()
+        }),
+    ).await?;
+    ```
+  </Step>
+
+  <Step title="Consume messages">
+    ```rust
+    // Single message
+    let message = queue.consume::<String>("my_queue", None).await?;
+    println!("Received: {}", message.payload);
+
+    // Batch consumption
+    let messages = queue.try_consume_batch::<String>("my_queue", 10, None).await?;
+    println!("Received {} messages", messages.len());
+    ```
+  </Step>
+
+  <Step title="Acknowledge or reject">
+    ```rust
+    // Success: acknowledge the message
+    queue.acknowledge("my_queue", &message).await?;
+
+    // Failure: reject (will retry or move to failed queue)
+    queue.reject("my_queue", &message).await?;
+    ```
+  </Step>
+</Steps>
+
+## Configuration
+
+### BrokerConfig Options
+
+The Redis broker respects the following configuration parameters:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `pool_connections` | `u8` | 10 | Maximum number of connections in the Redis connection pool |
+| `retry_attempts` | `u8` | 3 | Maximum number of retry attempts for failed messages |
+| `retry_failed` | `bool` | true | Whether to retry failed messages |
+| `enable_scheduling` | `bool` | false | Enable time-based message scheduling |
+
+<Note>
+For production deployments, consider increasing `pool_connections` based on your throughput requirements. Monitor Redis connection usage and adjust accordingly.
+</Note>
+
+### Complete Configuration Example
+
+```rust
+use broccoli_queue::{BroccoliQueue, brokers::broker::BrokerConfig};
+use std::time::Duration;
+
+let config = BrokerConfig {
+    pool_connections: Some(30),      // Increase for high throughput
+    retry_attempts: Some(5),          // More retries for critical tasks
+    retry_failed: Some(true),         // Always retry failed messages
+    enable_scheduling: Some(true),    // Enable message scheduling
+    #[cfg(feature = "surrealdb")]
+    surrealdb_connection: None,
+};
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .with_broker_config(config)
+    .build::<MyMessageType>()
+    .await?;
+```
+
+## Data Structure
+
+Redis uses an efficient internal structure for message management:
+
+<Accordion title="Internal Architecture">
+**Message Storage**
+
+Each message is stored as a Redis hash with the task ID as the key:
+
+- `task_id` — Unique message identifier
+- `payload` — JSON-serialized message content
+- `attempts` — Number of processing attempts
+- `priority` — Message priority (1–5)
+- `disambiguator` — Optional queue routing key
+
+**Queue Management**
+
+Messages are ordered using sorted sets with priority-weighted timestamps:
+
+- `{queue_name}` — Main queue (sorted set)
+- `{queue_name}_processing` — In-flight messages list
+- `{queue_name}_failed` — Failed messages after retry exhaustion
+
+**Fairness Queuing**
+
+For fairness-enabled queues, separate sub-queues are maintained:
+
+- `{queue_name}_fairness_set` — Tracks active disambiguators
+- `{queue_name}_fairness_round_robin` — Round-robin consumer order
+- `{queue_name}_{disambiguator}_queue` — Per-disambiguator queue
+</Accordion>
+
+## Features & Capabilities
+
+### ✅ Fully Supported
+
+- **Fairness Queuing**: Redis is the only backend with full fairness support. Messages can be consumed in round-robin fashion based on a disambiguator field
+- **Message Scheduling**: Delay or schedule message delivery with `PublishOptions`
+- **Batch Operations**: Efficiently consume multiple messages with `try_consume_batch()`
+- **Message Rejection**: Automatic retry with incrementing attempt counters
+- **Priority Levels**: 5-tier priority system (1 = highest, 5 = lowest)
+- **Message Cancellation**: Remove messages before processing
+- **Queue Introspection**: Query queue sizes
+- **Management API**: When enabled, access detailed queue statistics
+
+### Priority & Fairness Example
+
+```rust
+// Fairness queuing: each "user" gets equal message processing
+let message = broccoli_queue::brokers::broker::BrokerMessage::new(
+    "task_data".to_string(),
+    Some("user_123".to_string()), // disambiguator
+);
+
+queue.publish_advanced(
+    "tasks",
+    vec![message],
+    Some(PublishOptions {
+        priority: Some(2),
+        ..Default::default()
+    }),
+).await?;
+
+// Consume with fairness enabled
+let msg = queue.consume_advanced::<String>(
+    "tasks",
+    Some(ConsumeOptions {
+        fairness: Some(true),
+        ..Default::default()
+    }),
+).await?;
+```
+
+## Local Development
+
+### Quick Start with Docker
+
+Run a development Redis instance in seconds:
+
+```bash
+docker run -d \
+  --name broccoli-redis \
+  -p 6379:6379 \
+  redis:latest
+```
+
+Or use Docker Compose:
+
+```yaml
+version: '3.8'
+services:
+  redis:
+    image: redis:latest
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
+```
+
+### Connection Troubleshooting
+
+<CardGroup>
+  <Card title="Connection Refused">
+    Verify Redis is running: `redis-cli ping` (should respond with `PONG`)
+  </Card>
+  <Card title="Authentication Failed">
+    Check your URL format: `redis://user:password@host:port`
+  </Card>
+  <Card title="TLS Issues">
+    Use `rediss://` scheme for TLS connections and ensure certificates are properly configured
+  </Card>
+</CardGroup>
+
+## Performance Characteristics
+
+Redis provides exceptional performance for Broccoli Queue operations:
+
+- **Throughput**: Processes thousands of messages per second
+- **Latency**: Sub-millisecond average latency for publish/consume
+- **Memory**: Efficient with long-lived connections via pooling
+- **Scalability**: Handles millions of queued messages
+
+### Benchmark Results
+
+Based on the included benchmarks:
+
+```
+Redis single publish: ~0.5ms
+Redis batch publish (10 msgs): ~2ms
+Redis single consume: ~0.3ms
+Redis batch consume (10 msgs): ~1.5ms
+Fairness queuing overhead: ~10-15%
+```
+
+<Tip>
+For optimal performance:
+1. Use connection pooling (enabled by default)
+2. Batch operations when possible
+3. Adjust pool size based on your concurrency level
+4. Monitor memory usage for very large queues
+</Tip>
+
+## Production Deployment
+
+### Best Practices
+
+<Steps>
+  <Step title="Use Redis Cluster for high availability">
+    Deploy Redis Cluster or Redis Sentinel for redundancy
+  </Step>
+  <Step title="Configure persistence">
+    Set up RDB snapshots or AOF logging for durability
+  </Step>
+  <Step title="Monitor queue sizes">
+    Track pending and failed message counts using the size API
+  </Step>
+  <Step title="Set appropriate retry limits">
+    Balance between fault tolerance and processing efficiency
+  </Step>
+  <Step title="Use scheduling for load distribution">
+    Delay message processing during peak hours
+  </Step>
+</Steps>
+
+### Connection Pool Tuning
+
+```rust
+let config = BrokerConfig {
+    pool_connections: Some(concurrent_workers as u8),
+    ..Default::default()
+};
+```
+
+Recommendation: Set `pool_connections` equal to or slightly higher than your number of concurrent workers.
+
+## Troubleshooting
+
+<Accordion title="Messages stuck in processing queue">
+  Use `cancel()` to remove messages from the processing queue:
+  ```rust
+  queue.cancel("my_queue", message_id).await?;
+  ```
+</Accordion>
+
+<Accordion title="Memory growth over time">
+  Ensure messages are properly acknowledged. Check failed message queues for accumulation.
+</Accordion>
+
+<Accordion title="Priority not working">
+  Verify `priority` is between 1-5. Outside this range returns an error.
+</Accordion>
+
+## Next Steps
+
+- Read about [RabbitMQ](/brokers/rabbitmq) for enterprise features
+- Explore [SurrealDB](/brokers/surrealdb) for embedded deployments
+- Learn about [queue management](/guides/management)
+- Review [consuming patterns](/guides/consuming)

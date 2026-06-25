@@ -1,0 +1,542 @@
+---
+title: "ConsumeOptions — Message Consumption Configuration"
+sidebarTitle: "ConsumeOptions"
+description: "Configure auto-acknowledgment, fairness, timing, and handler behavior for message consumption."
+---
+
+`ConsumeOptions` struct and `ConsumeOptionsBuilder` allow you to configure message consumption behavior, including automatic acknowledgment, fairness queuing, sleep intervals, and handler-level acknowledgment control.
+
+## Struct Definition
+
+```rust
+pub struct ConsumeOptions {
+    pub auto_ack: Option<bool>,
+    pub fairness: Option<bool>,
+    pub consume_wait: Option<std::time::Duration>,
+    pub handler_ack: Option<bool>,
+}
+```
+
+<ResponseField name="auto_ack" type="Option<bool>">
+Whether to automatically acknowledge messages immediately upon consumption.
+
+**Default:** `Some(false)` — manual acknowledgment required
+
+**Behavior:**
+- **`true`:** Message is acknowledged immediately after consuming. Calling `acknowledge()` or `reject()` afterward results in an error.
+- **`false`:** Message is not acknowledged on consume. You must manually call `acknowledge()` or `reject()` to handle it.
+
+**Use case:** Set to `true` when you want "fire-and-forget" semantics with no retry logic. Use `false` (default) when you need reliability and control over message handling.
+</ResponseField>
+
+<ResponseField name="fairness" type="Option<bool>">
+Enable round-robin consumption from per-disambiguator sub-queues.
+
+**Default:** `None` (disabled)
+
+**Redis only:** This feature is exclusive to Redis broker implementations.
+
+**Behavior:**
+- **`true`:** Messages are consumed fairly across different disambiguator values, ensuring all producers get attention even if one produces much more.
+- **`false` or `None`:** Messages are consumed FIFO from the main queue; high-volume producers can starve others.
+
+**Example:** If you have messages with disambiguators "user-123" and "user-456", fairness ensures both receive processing time even if "user-123" produces twice as many messages.
+</ResponseField>
+
+<ResponseField name="consume_wait" type="Option<std::time::Duration>">
+Sleep duration between iterations in tight consumer loops (e.g., `process_messages`).
+
+**Default:** `None` (treated as zero)
+
+**Purpose:** Allows tokio to cancel and interrupt the consumer task gracefully, even during tight loops. Setting this to zero disables the sleep but still allows cancellation at await points.
+
+**Typical values:**
+- `Duration::ZERO` — no sleep, maximum performance (default)
+- `Duration::from_millis(100)` — 100ms sleep, allows responsive cancellation
+- `Duration::from_secs(1)` — 1 second sleep, low CPU usage but slower response to cancellation
+
+**Use case:** Set this when you want the consumer to be responsive to task cancellation (e.g., graceful shutdown).
+</ResponseField>
+
+<ResponseField name="handler_ack" type="Option<bool>">
+Whether to acknowledge a message after the handler completes successfully.
+
+**Default:** `Some(true)` — auto-acknowledge on handler success
+
+**Behavior (in `process_messages` and `process_messages_with_handlers`):**
+- **`true`:** Successful handler execution automatically acknowledges the message.
+- **`false`:** Successful handler execution does NOT acknowledge. You must handle acknowledgment separately (e.g., spawn a reaper task, delegate to another service).
+
+**Handler error:** Handler returning `Err` always rejects the message, regardless of `handler_ack`.
+
+**Use cases:**
+- **`true` (default):** Simple case where handler processes and completes atomically.
+- **`false`:** Handler spawns long-running tasks, external services handle cleanup, or you want explicit control over acknowledgment timing.
+
+**Warning:** If `false` and you don't acknowledge elsewhere, messages stay in the processing queue indefinitely.
+</ResponseField>
+
+## Builder Interface
+
+### Construction
+
+```rust
+impl ConsumeOptions {
+    pub const fn builder() -> ConsumeOptionsBuilder
+}
+
+impl ConsumeOptionsBuilder {
+    pub const fn new() -> Self
+}
+```
+
+### Builder Methods
+
+```rust
+pub struct ConsumeOptionsBuilder {
+    auto_ack: Option<bool>,
+    fairness: Option<bool>,
+    consume_wait: Option<std::time::Duration>,
+    handler_ack: Option<bool>,
+}
+```
+
+#### `auto_ack`
+
+Enables or disables automatic acknowledgment on consume.
+
+```rust
+pub const fn auto_ack(mut self, auto_ack: bool) -> Self
+```
+
+<ParamField path="auto_ack" type="bool">
+`true` to auto-acknowledge, `false` for manual acknowledgment.
+</ParamField>
+
+**Returns:** `Self` for method chaining.
+
+<CodeGroup>
+```rust Auto-Acknowledge (Fire and Forget)
+ConsumeOptions::builder()
+    .auto_ack(true)
+    .build()
+```
+
+```rust Manual Acknowledgment (Reliable)
+ConsumeOptions::builder()
+    .auto_ack(false)
+    .build()
+```
+</CodeGroup>
+
+#### `fairness`
+
+Enables or disables fairness queue consumption (Redis only).
+
+```rust
+pub const fn fairness(mut self, fairness: bool) -> Self
+```
+
+<ParamField path="fairness" type="bool">
+`true` to enable fairness, `false` to consume FIFO.
+</ParamField>
+
+**Returns:** `Self` for method chaining.
+
+**Redis only:** Has no effect on RabbitMQ or SurrealDB.
+
+<CodeGroup>
+```rust Enable Fairness (Redis)
+ConsumeOptions::builder()
+    .fairness(true)
+    .build()
+```
+
+```rust Standard FIFO (Default)
+ConsumeOptions::builder()
+    .fairness(false)
+    .build()
+```
+</CodeGroup>
+
+#### `consume_wait`
+
+Sets the sleep duration between loop iterations in `process_messages`.
+
+```rust
+pub const fn consume_wait(mut self, consume_wait: std::time::Duration) -> Self
+```
+
+<ParamField path="consume_wait" type="std::time::Duration">
+Duration to sleep between consume attempts. Use `Duration::ZERO` for no sleep.
+</ParamField>
+
+**Returns:** `Self` for method chaining.
+
+<CodeGroup>
+```rust No Sleep (Maximum Performance)
+ConsumeOptions::builder()
+    .consume_wait(std::time::Duration::ZERO)
+    .build()
+```
+
+```rust 100ms Sleep (Responsive Shutdown)
+ConsumeOptions::builder()
+    .consume_wait(std::time::Duration::from_millis(100))
+    .build()
+```
+
+```rust 1 Second Sleep (Low CPU)
+ConsumeOptions::builder()
+    .consume_wait(std::time::Duration::from_secs(1))
+    .build()
+```
+</CodeGroup>
+
+#### `handler_ack`
+
+Controls whether handlers automatically acknowledge successful completions.
+
+```rust
+pub const fn handler_ack(mut self, followup: bool) -> Self
+```
+
+<ParamField path="followup" type="bool">
+`true` to auto-acknowledge on handler success, `false` for manual.
+</ParamField>
+
+**Returns:** `Self` for method chaining.
+
+<CodeGroup>
+```rust Auto-Acknowledge Handler Success (Default)
+ConsumeOptions::builder()
+    .handler_ack(true)
+    .build()
+```
+
+```rust Manual Handler Acknowledgment
+ConsumeOptions::builder()
+    .handler_ack(false)
+    .build()
+```
+</CodeGroup>
+
+#### `build`
+
+Builds the `ConsumeOptions` struct.
+
+```rust
+pub const fn build(self) -> ConsumeOptions
+```
+
+**Returns:** `ConsumeOptions`
+
+<CodeGroup>
+```rust
+let options = ConsumeOptions::builder()
+    .auto_ack(false)
+    .fairness(true)
+    .consume_wait(std::time::Duration::from_millis(100))
+    .handler_ack(true)
+    .build();
+```
+</CodeGroup>
+
+## Struct Literal vs Builder
+
+You can construct `ConsumeOptions` as a struct literal or using the builder.
+
+<CodeGroup>
+```rust Struct Literal
+use broccoli_queue::queue::ConsumeOptions;
+use std::time::Duration;
+
+let options = ConsumeOptions {
+    auto_ack: Some(false),
+    fairness: Some(true),
+    consume_wait: Some(Duration::from_millis(100)),
+    handler_ack: Some(true),
+};
+```
+
+```rust Builder Pattern
+let options = ConsumeOptions::builder()
+    .auto_ack(false)
+    .fairness(true)
+    .consume_wait(Duration::from_millis(100))
+    .handler_ack(true)
+    .build();
+```
+
+```rust Using Default
+let options = ConsumeOptions::default();
+// auto_ack: Some(false)
+// fairness: None
+// consume_wait: None
+// handler_ack: Some(true)
+```
+</CodeGroup>
+
+## Usage Examples
+
+### Basic Consumption with Manual Acknowledgment
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, ConsumeOptions};
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Message {
+    id: String,
+    data: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+
+    // Use default options (auto_ack: false, handler_ack: true)
+    let message: broccoli_queue::brokers::broker::BrokerMessage<Message> =
+        queue.consume("events", None).await?;
+
+    println!("Received: {}", message.payload.id);
+
+    // Process and acknowledge
+    process_message(&message.payload).await?;
+    queue.acknowledge("events", message).await?;
+
+    Ok(())
+}
+
+async fn process_message(msg: &Message) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Processing: {}", msg.data);
+    Ok(())
+}
+```
+
+### Auto-Acknowledge (Fire and Forget)
+
+```rust
+use broccoli_queue::queue::ConsumeOptions;
+
+let options = ConsumeOptions::builder()
+    .auto_ack(true)
+    .build();
+
+let message = queue.consume::<Message>("events", Some(options)).await?;
+
+// Message is already acknowledged; do NOT call acknowledge/reject
+println!("Message processed: {}", message.payload.id);
+```
+
+### Process Messages with Fairness (Redis)
+
+```rust
+use broccoli_queue::queue::ConsumeOptions;
+
+let options = ConsumeOptions::builder()
+    .fairness(true)  // Round-robin across disambiguators
+    .build();
+
+queue.process_messages(
+    "events",
+    Some(4),  // 4 concurrent workers
+    Some(options),
+    |message| async move {
+        process_message(&message.payload).await
+    }
+).await?;
+```
+
+### Graceful Shutdown with Consume Wait
+
+```rust
+use broccoli_queue::queue::ConsumeOptions;
+use std::time::Duration;
+
+let options = ConsumeOptions::builder()
+    .consume_wait(Duration::from_millis(100))  // Check for cancellation every 100ms
+    .build();
+
+let consumer_task = tokio::spawn({
+    let queue = queue.clone();
+    async move {
+        queue.process_messages(
+            "events",
+            Some(4),
+            Some(options),
+            |message| async move {
+                process_message(&message.payload).await
+            }
+        ).await
+    }
+});
+
+// Later: graceful shutdown
+tokio::time::sleep(Duration::from_secs(30)).await;
+consumer_task.abort();  // Will be responsive because of consume_wait
+```
+
+### Manual Acknowledgment with Long-Running Tasks
+
+```rust
+use broccoli_queue::queue::ConsumeOptions;
+
+let options = ConsumeOptions::builder()
+    .handler_ack(false)  // Don't auto-acknowledge after handler
+    .build();
+
+queue.process_messages(
+    "events",
+    Some(4),
+    Some(options),
+    |message| async move {
+        // Spawn a long-running task without waiting
+        tokio::spawn({
+            let msg = message.clone();
+            async move {
+                perform_long_operation(&msg.payload).await;
+                // Note: acknowledge is not called here; must be handled separately
+            }
+        });
+        Ok(())
+    }
+).await?;
+
+// Elsewhere: a reaper task handles acknowledgment
+// queue.acknowledge("events", message).await?;
+```
+
+### Process Messages with Success/Error Handlers and Custom Timing
+
+```rust
+use broccoli_queue::queue::ConsumeOptions;
+use std::time::Duration;
+
+let options = ConsumeOptions::builder()
+    .consume_wait(Duration::from_millis(50))
+    .handler_ack(true)
+    .build();
+
+queue.process_messages_with_handlers(
+    "events",
+    Some(4),
+    Some(options),
+    // Message handler
+    |message| async move {
+        process_message(&message.payload).await
+    },
+    // Success handler
+    |message, _result| async move {
+        println!("Success: {}", message.payload.id);
+        Ok(())
+    },
+    // Error handler
+    |message, error| async move {
+        eprintln!("Failed: {} — {}", message.payload.id, error);
+        Ok(())
+    },
+).await?;
+```
+
+### Fairness with High Concurrency
+
+```rust
+use broccoli_queue::queue::ConsumeOptions;
+
+let options = ConsumeOptions::builder()
+    .fairness(true)
+    .consume_wait(Duration::ZERO)
+    .build();
+
+queue.process_messages(
+    "events",
+    Some(20),  // High concurrency
+    Some(options),
+    |message| async move {
+        // Messages consumed fairly across disambiguators
+        process_message(&message.payload).await
+    }
+).await?;
+```
+
+## Important Notes
+
+### Auto-Acknowledgment Errors
+
+If you consume with `auto_ack: true` and then try to acknowledge or reject manually:
+
+```rust
+let options = ConsumeOptions::builder().auto_ack(true).build();
+let message = queue.consume("events", Some(options)).await?;
+
+// ERROR: message already acknowledged
+queue.acknowledge("events", message).await?;  // Fails!
+```
+
+### Handler Acknowledgment in process_messages
+
+The `handler_ack` option **only affects `process_messages` and `process_messages_with_handlers`**. It does not affect manual consumption via `consume()` or `try_consume()`.
+
+<CodeGroup>
+```rust Manual Consume (handler_ack ignored)
+let message = queue.consume("events", Some(options)).await?;
+// Must manually call acknowledge or reject
+queue.acknowledge("events", message).await?;
+```
+
+```rust process_messages (handler_ack respected)
+queue.process_messages(
+    "events",
+    Some(4),
+    Some(options),  // handler_ack controls auto-ack behavior
+    |message| async move {
+        process(message.payload).await
+    }
+).await?;
+```
+</CodeGroup>
+
+### Fairness and Disambiguators
+
+Fairness works with the `disambiguator` parameter in `publish()`:
+
+```rust
+// Messages with different disambiguators
+queue.publish("events", Some("user-1".into()), &msg1, None).await?;
+queue.publish("events", Some("user-2".into()), &msg2, None).await?;
+
+// With fairness=true, consumption alternates between user-1 and user-2 sub-queues
+let options = ConsumeOptions::builder().fairness(true).build();
+let message = queue.consume("events", Some(options)).await?;
+```
+
+### Consume Wait and Task Cancellation
+
+`consume_wait` enables responsive cancellation in `process_messages`:
+
+- **`Duration::ZERO`:** Maximum throughput; cancellation may be delayed until the next message arrives.
+- **`Duration::from_millis(100)`:** Responsive cancellation; checked every 100ms.
+- **Larger values:** Lower CPU usage; slower response to cancellation.
+
+Choose based on your shutdown latency requirements.
+
+## Default Values
+
+When `ConsumeOptions::default()` is used or fields are `None`:
+
+| Field | Default |
+| --- | --- |
+| `auto_ack` | `Some(false)` |
+| `fairness` | `None` |
+| `consume_wait` | `None` |
+| `handler_ack` | `Some(true)` |
+
+## Broker-Specific Behavior
+
+| Feature | Redis | RabbitMQ | SurrealDB |
+| --- | --- | --- | --- |
+| `auto_ack` | Supported | Supported | Supported |
+| `fairness` | ✅ Supported | ❌ Not supported | ❌ Not supported |
+| `consume_wait` | Timing control | Timing control | Timing control |
+| `handler_ack` | Supported | Supported | Supported |

@@ -1,0 +1,325 @@
+---
+title: "Install and Configure Broccoli for Your Broker"
+sidebarTitle: "Installation"
+description: "Add Broccoli to your Cargo.toml, choose your broker backend, and configure connection URLs for Redis, RabbitMQ, or SurrealDB."
+---
+
+**Install Broccoli and configure your message broker backend.** The library supports Redis (default), RabbitMQ, and SurrealDB, with flexible feature flags for minimal dependencies.
+
+## Basic Installation
+
+Add to your `Cargo.toml`:
+
+```toml
+[dependencies]
+broccoli_queue = "0.4.6"
+```
+
+This installs Broccoli with the **Redis broker enabled by default**. You'll also need a runtime:
+
+```toml
+[dependencies]
+broccoli_queue = "0.4.6"
+tokio = { version = "1.42", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+```
+
+## Choosing Your Broker
+
+Broccoli requires **at least one broker feature** to be enabled. You cannot use Broccoli with zero broker features—attempting to compile will produce a `compile_error!`.
+
+### Redis (Default)
+
+Perfect for: Development, small-to-medium workloads, familiar tooling.
+
+```toml
+[dependencies]
+broccoli_queue = "0.4.6"  # redis feature enabled by default
+```
+
+**Connection URL:** `redis://host:port`
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379").build().await?;
+```
+
+### RabbitMQ
+
+Perfect for: Enterprise deployments, complex routing, high reliability requirements.
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["rabbitmq"], default-features = false }
+tokio = { version = "1.42", features = ["full"] }
+```
+
+**Connection URL:** `amqp://user:password@host:port`
+
+```rust
+let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672").build().await?;
+```
+
+### SurrealDB
+
+Perfect for: Embedded scenarios, in-memory testing, multi-model queries.
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["surrealdb"], default-features = false }
+```
+
+**Connection URLs:**
+- WebSocket (remote): `ws://host:port`
+- In-memory (local): `mem://`
+
+```rust
+// Remote SurrealDB
+let queue = BroccoliQueue::builder("ws://localhost:8000").build().await?;
+
+// In-memory SurrealDB (for testing)
+let queue = BroccoliQueue::builder("mem://").build().await?;
+```
+
+### Multiple Brokers
+
+Enable multiple brokers in a single binary:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["redis", "rabbitmq"] }
+```
+
+Then select at runtime based on environment or configuration:
+
+```rust
+let url = if use_rabbitmq {
+    "amqp://localhost:5672"
+} else {
+    "redis://localhost:6379"
+};
+
+let queue = BroccoliQueue::builder(url).build().await?;
+```
+
+## Optional Features
+
+### Management API
+
+Enable inspection and management of queue state:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["redis", "management"] }
+```
+
+Provides APIs to:
+- Query queue length
+- Inspect job status
+- Cancel pending jobs
+- Monitor worker health
+
+### Test Fairness
+
+Enable fairness queue testing for benchmarking:
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["redis", "test-fairness"] }
+```
+
+Used for validating equitable task distribution across workers.
+
+## Runtime Requirements
+
+### Tokio
+
+Broccoli requires the **Tokio async runtime** with full features:
+
+```toml
+[dependencies]
+tokio = { version = "1.42", features = ["full"] }
+```
+
+Minimal Tokio feature set (recommended for production):
+
+```toml
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "io-util", "time", "net"] }
+```
+
+### Serialization
+
+Broccoli uses **serde** for message serialization. You must enable the derive feature:
+
+```toml
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+```
+
+All message types must derive `Serialize` and `Deserialize`:
+
+```rust
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+struct MyTask {
+    id: String,
+    data: String,
+}
+```
+
+## Complete Configuration Examples
+
+### Production Setup with Redis
+
+```toml
+[package]
+name = "my-queue-service"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["redis", "management"] }
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "time", "sync"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+env_logger = "0.11"
+```
+
+### Development Setup with Redis & Testing
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["redis", "test-fairness"] }
+tokio = { version = "1.42", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[dev-dependencies]
+tempfile = "3.8"
+```
+
+### RabbitMQ for Enterprise
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["rabbitmq", "management"], default-features = false }
+tokio = { version = "1.42", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+```
+
+### SurrealDB for Embedded
+
+```toml
+[dependencies]
+broccoli_queue = { version = "0.4.6", features = ["surrealdb"], default-features = false }
+tokio = { version = "1.42", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+```
+
+## Connection URLs Reference
+
+<Tabs>
+  <Tab title="Redis">
+    ```
+    redis://localhost:6379                    # Default local
+    redis://username:password@host:6379       # With auth
+    redis://host:port/db_number               # With database selection
+    ```
+
+    Environment variable:
+    ```bash
+    export BROCCOLI_REDIS_URL="redis://localhost:6379"
+    ```
+  </Tab>
+
+  <Tab title="RabbitMQ">
+    ```
+    amqp://localhost:5672                     # Default local
+    amqp://guest:guest@localhost:5672         # With credentials
+    amqp://user:pass@host:5672/vhost          # With virtual host
+    ```
+
+    Environment variable:
+    ```bash
+    export BROCCOLI_AMQP_URL="amqp://guest:guest@localhost:5672"
+    ```
+  </Tab>
+
+  <Tab title="SurrealDB">
+    ```
+    ws://localhost:8000                       # Remote WebSocket
+    mem://                                    # In-memory (testing)
+    ws://user:pass@host:port                  # With credentials
+    ```
+
+    Environment variable:
+    ```bash
+    export BROCCOLI_SURREAL_URL="ws://localhost:8000"
+    ```
+  </Tab>
+</Tabs>
+
+## Initializing the Queue
+
+Once installed and configured, initialize `BroccoliQueue` with your broker URL:
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(10)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    // Queue is ready to use
+    Ok(())
+}
+```
+
+## Verification
+
+Test your installation:
+
+```bash
+cargo build
+```
+
+If you get a `compile_error` about missing broker features, ensure at least one broker is enabled:
+
+```toml
+# ❌ This will fail to compile
+broccoli_queue = { version = "0.4.6", default-features = false }
+
+# ✅ This works
+broccoli_queue = { version = "0.4.6", features = ["redis"] }
+```
+
+## What's Next?
+
+<CardGroup>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Write your first publisher and consumer in 5 minutes.
+  </Card>
+  <Card title="Queue Concepts" icon="lightbulb" href="/concepts/queue">
+    Learn about publishing options, job scheduling, and concurrency control.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/broccoli-queue">
+    Explore the complete `BroccoliQueue` builder and configuration API.
+  </Card>
+</CardGroup>
+
+<Info>
+For Docker, standard images are available:
+- **Redis**: `docker run -p 6379:6379 redis:7-alpine`
+- **RabbitMQ**: `docker run -p 5672:5672 -p 15672:15672 rabbitmq:3.12-management-alpine`
+- **SurrealDB**: `docker run -p 8000:8000 surrealdb/surrealdb:latest start`
+</Info>

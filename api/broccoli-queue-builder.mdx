@@ -1,0 +1,340 @@
+---
+title: "BroccoliQueueBuilder — Queue Configuration"
+sidebarTitle: "QueueBuilder"
+description: "Fluent builder interface for configuring BroccoliQueue with connection pooling, retry strategy, and scheduling settings."
+---
+
+The `BroccoliQueueBuilder` struct provides a fluent builder pattern for configuring and constructing a `BroccoliQueue` instance. It allows you to set connection pool size, retry behavior, and message scheduling options before building the queue.
+
+## Creating a Builder
+
+### `new`
+
+Creates a new builder with the specified broker URL.
+
+```rust
+pub fn new(broker_url: impl Into<String>) -> Self
+```
+
+<ParamField path="broker_url" type="impl Into<String>">
+The connection URL of the message broker (e.g., `redis://localhost:6379`, `amqp://localhost:5672`, `ws://localhost:8000`).
+</ParamField>
+
+### `new_with_surrealdb` (SurrealDB only)
+
+Creates a new builder with an existing SurrealDB connection. Only available with the `surrealdb` feature.
+
+```rust
+#[cfg(feature = "surrealdb")]
+pub fn new_with_surrealdb(db: surrealdb::Surreal<surrealdb::engine::any::Any>) -> Self
+```
+
+<ParamField path="db" type="surrealdb::Surreal<surrealdb::engine::any::Any>">
+An existing SurrealDB connection to reuse.
+</ParamField>
+
+<Note>
+When using `new_with_surrealdb`, the broker URL is not used (set to a placeholder internally), as your connection is already established.
+</Note>
+
+## Configuration Methods
+
+### `failed_message_retry_strategy`
+
+Configures how failed messages should be retried.
+
+```rust
+pub fn failed_message_retry_strategy(mut self, strategy: RetryStrategy) -> Self
+```
+
+<ParamField path="strategy" type="RetryStrategy">
+A `RetryStrategy` defining whether to retry failed messages and the maximum number of retry attempts.
+
+<Expandable title="RetryStrategy fields">
+<ResponseField name="retry_failed" type="bool">
+Whether failed messages should be retried. If `true`, messages are re-queued; if `false`, they go directly to the failed queue.
+</ResponseField>
+
+<ResponseField name="attempts" type="Option<u8>">
+Maximum number of retry attempts. If `None`, defaults to 3. Each retry increments the message's `attempts` counter.
+</ResponseField>
+</Expandable>
+</ParamField>
+
+**Returns:** `Self` for method chaining.
+
+**Default:** Retry enabled with 3 attempts (via `RetryStrategy::default()`).
+
+<CodeGroup>
+```rust Default Retry Strategy
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(RetryStrategy::default())
+    .build()
+    .await?;
+```
+
+```rust Custom Attempts
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(
+        RetryStrategy::new().with_attempts(5)
+    )
+    .build()
+    .await?;
+```
+
+```rust Disable Retries
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .failed_message_retry_strategy(
+        RetryStrategy::new().retry_failed(false)
+    )
+    .build()
+    .await?;
+```
+</CodeGroup>
+
+### `pool_connections`
+
+Configures the number of broker connections to maintain in the connection pool.
+
+```rust
+pub fn pool_connections(mut self, connections: u8) -> Self
+```
+
+<ParamField path="connections" type="u8">
+Number of connections to maintain. Higher values support more concurrent operations but use more resources.
+</ParamField>
+
+**Returns:** `Self` for method chaining.
+
+**Default:** 10 connections.
+
+<Note>
+The optimal pool size depends on:
+- **Concurrency level** — more concurrent operations need more connections
+- **Broker limits** — check your broker's max connection settings
+- **Memory constraints** — each connection uses memory
+
+Start with 10 and adjust based on performance metrics.
+</Note>
+
+<CodeGroup>
+```rust Small Pool (Single Consumer)
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(5)
+    .build()
+    .await?;
+```
+
+```rust Large Pool (High Concurrency)
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(20)
+    .build()
+    .await?;
+```
+</CodeGroup>
+
+### `enable_scheduling`
+
+Enables or disables delayed and scheduled message delivery.
+
+```rust
+pub fn enable_scheduling(mut self, enable_scheduling: bool) -> Self
+```
+
+<ParamField path="enable_scheduling" type="bool">
+If `true`, enables support for `PublishOptions.delay` and `PublishOptions.scheduled_at`. If `false` (default), these options are ignored.
+</ParamField>
+
+**Returns:** `Self` for method chaining.
+
+**Default:** `false` (scheduling disabled).
+
+<Warning>
+**RabbitMQ Note:** If you enable scheduling with RabbitMQ, you must install the [delayed-exchange plugin](https://www.rabbitmq.com/blog/2015/04/16/scheduling-messages-with-rabbitmq) on your broker. Without it, scheduled messages will fail.
+
+**Redis and SurrealDB:** Scheduling is built-in; no additional setup is required.
+</Warning>
+
+<CodeGroup>
+```rust Enable Scheduling
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .enable_scheduling(true)
+    .build()
+    .await?;
+
+// Now you can use delay and scheduled_at
+queue.publish(
+    "events",
+    None,
+    &message,
+    Some(PublishOptions::builder()
+        .delay(Duration::seconds(30))
+        .build())
+).await?;
+```
+
+```rust RabbitMQ with Scheduling
+let queue = BroccoliQueue::builder("amqp://localhost:5672")
+    .enable_scheduling(true)  // Requires delayed-exchange plugin
+    .build()
+    .await?;
+```
+</CodeGroup>
+
+## Building the Queue
+
+### `build`
+
+Constructs the `BroccoliQueue` with the configured settings. This is an async method that connects to the broker.
+
+```rust
+pub async fn build(self) -> Result<BroccoliQueue, BroccoliError>
+```
+
+**Returns:** `Result<BroccoliQueue, BroccoliError>`
+
+- On success: A fully initialized `BroccoliQueue` ready to use.
+- On failure: A `BroccoliError` describing the connection issue.
+
+**Errors:**
+- `BroccoliError::Broker` — if the connection to the broker fails (invalid URL, broker unreachable, authentication error, etc.)
+
+<Note>
+The `build()` call establishes the actual connection. All previous builder methods are configuration only; they don't require the broker to be reachable.
+</Note>
+
+<CodeGroup>
+```rust Basic Build
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .build()
+    .await?;
+```
+
+```rust With Error Handling
+match BroccoliQueue::builder("redis://localhost:6379")
+    .build()
+    .await
+{
+    Ok(queue) => println!("Queue initialized"),
+    Err(e) => eprintln!("Failed to connect to broker: {}", e),
+}
+```
+</CodeGroup>
+
+## Complete Examples
+
+### Redis Queue with Custom Configuration
+
+```rust
+use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(15)
+        .failed_message_retry_strategy(
+            RetryStrategy::new()
+                .retry_failed(true)
+                .with_attempts(5)
+        )
+        .build()
+        .await?;
+
+    println!("Queue initialized successfully");
+    Ok(())
+}
+```
+
+### High-Concurrency Setup with Scheduling
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("redis://localhost:6379")
+        .pool_connections(25)
+        .enable_scheduling(true)
+        .failed_message_retry_strategy(Default::default())
+        .build()
+        .await?;
+
+    println!("High-concurrency queue with scheduling enabled");
+    Ok(())
+}
+```
+
+### RabbitMQ with Delayed Messages
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = BroccoliQueue::builder("amqp://guest:guest@localhost:5672")
+        .pool_connections(10)
+        .enable_scheduling(true)  // Requires delayed-exchange plugin
+        .build()
+        .await?;
+
+    println!("RabbitMQ queue with scheduling enabled");
+    Ok(())
+}
+```
+
+### SurrealDB with Existing Connection
+
+```rust
+use broccoli_queue::queue::BroccoliQueue;
+use surrealdb::Surreal;
+use surrealdb::engine::any::Any;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Create your own SurrealDB connection with custom settings
+    let db = Surreal::new::<Any>("ws://localhost:8000").await?;
+    db.use_ns("broccoli").use_db("queues").await?;
+
+    let queue = BroccoliQueue::builder_with(db)
+        .pool_connections(10)
+        .build()
+        .await?;
+
+    println!("SurrealDB queue initialized with custom connection");
+    Ok(())
+}
+```
+
+### Builder Chaining Pattern
+
+```rust
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(10)
+    .enable_scheduling(true)
+    .failed_message_retry_strategy(
+        RetryStrategy::new()
+            .with_attempts(3)
+            .retry_failed(true)
+    )
+    .build()
+    .await?;
+```
+
+## Default Values
+
+| Configuration | Default |
+| --- | --- |
+| Pool Connections | 10 |
+| Retry Failed | `true` |
+| Retry Attempts | 3 |
+| Scheduling Enabled | `false` |
+
+## Validation
+
+The builder performs basic validation on `build()`:
+
+- **Broker URL format:** Must be a valid URL for the target broker (e.g., `redis://`, `amqp://`, `ws://`).
+- **Broker reachability:** The broker must be accessible at the specified URL.
+- **RabbitMQ scheduling:** If enabled, the broker must support the delayed-exchange plugin.
+
+Invalid configurations result in a `BroccoliError::Broker` on `build()`.

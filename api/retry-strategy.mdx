@@ -1,0 +1,339 @@
+---
+title: "RetryStrategy: Configure Message Retry Behavior"
+sidebarTitle: "RetryStrategy"
+description: "Configuration struct for defining failed message retry behavior, attempt limits, and recovery strategies."
+---
+
+`RetryStrategy` controls what happens when a message handler returns an error. It defines whether failed messages should be retried and how many attempts are allowed before moving the message to a failed queue.
+
+## Overview
+
+When a message handler fails (returns an error), Broccoli needs to decide what to do with that message. The `RetryStrategy` provides this configuration, allowing you to enable/disable retries and set maximum attempt limits.
+
+```rust
+pub struct RetryStrategy {
+    pub retry_failed: bool,
+    pub attempts: Option<u8>,  // defaults to 3 if None
+}
+```
+
+## Fields
+
+<ResponseField name="retry_failed" type="bool">
+  Whether failed messages should be retried. If `true`, messages are re-queued after handler failure. If `false`, they immediately move to the failed queue.
+</ResponseField>
+
+<ResponseField name="attempts" type="Option<u8>">
+  Maximum number of attempts allowed. When `None` defaults to 3. When a message reaches this attempt count, it moves to `{topic}_failed` queue regardless of `retry_failed` setting.
+</ResponseField>
+
+## Default Implementation
+
+The default retry strategy enables retries with 3 maximum attempts:
+
+```rust
+impl Default for RetryStrategy {
+    fn default() -> Self {
+        Self {
+            retry_failed: true,
+            attempts: Some(3),
+        }
+    }
+}
+```
+
+## Constructor Methods
+
+### `new()`
+
+Creates a new `RetryStrategy` with default settings (retries enabled, 3 attempts):
+
+```rust
+#[must_use]
+pub const fn new() -> Self
+```
+
+```rust
+let strategy = RetryStrategy::new();
+assert_eq!(strategy.retry_failed, true);
+assert_eq!(strategy.attempts, Some(3));
+```
+
+### `with_attempts(attempts)`
+
+Sets the maximum number of retry attempts:
+
+```rust
+#[must_use]
+pub const fn with_attempts(mut self, attempts: u8) -> Self
+```
+
+**Parameters:**
+- `attempts` - Maximum number of times a failed message will be retried
+
+**Returns:** Updated `RetryStrategy`
+
+```rust
+let strategy = RetryStrategy::new()
+    .with_attempts(5);
+// Will retry up to 5 times before moving to failed queue
+```
+
+### `retry_failed(retry_failed)`
+
+Enables or disables message retrying:
+
+```rust
+#[must_use]
+pub const fn retry_failed(mut self, retry_failed: bool) -> Self
+```
+
+**Parameters:**
+- `retry_failed` - If `true`, enable retries; if `false`, disable retries
+
+**Returns:** Updated `RetryStrategy`
+
+```rust
+let strategy = RetryStrategy::new()
+    .retry_failed(false);
+// Failed messages go directly to failed queue, no retries
+```
+
+## Retry Behavior
+
+Understanding what happens at each attempt:
+
+<Expandable title="Attempt Behavior">
+  When a handler returns an error:
+  
+  1. **First attempt (attempts = 0)**: Handler fails, message is retried if `retry_failed: true`
+  2. **Retry attempts (0 < attempts < limit)**: Message goes back to the queue, will be tried again
+  3. **At attempt limit**: Message moves to `{topic}_failed` queue permanently
+  
+  **Example with limit = 3:**
+  - Attempt 1 fails → retry (attempts becomes 1)
+  - Attempt 2 fails → retry (attempts becomes 2)
+  - Attempt 3 fails → retry (attempts becomes 3)
+  - Attempt 4 fails → move to failed queue (attempts ≥ limit)
+</Expandable>
+
+## Configuration Examples
+
+<Tabs>
+  <Tab title="Default - 3 retries">
+    ```rust
+    // Use default: 3 attempts, retries enabled
+    let queue = BroccoliQueue::builder("redis://localhost")
+        .failed_message_retry_strategy(RetryStrategy::default())
+        .build()
+        .await?;
+    ```
+  </Tab>
+  
+  <Tab title="No retries">
+    ```rust
+    // Fail immediately on error, no retries
+    let queue = BroccoliQueue::builder("redis://localhost")
+        .failed_message_retry_strategy(
+            RetryStrategy::new().retry_failed(false)
+        )
+        .build()
+        .await?;
+    ```
+  </Tab>
+  
+  <Tab title="5 attempts">
+    ```rust
+    // Retry up to 5 times before giving up
+    let queue = BroccoliQueue::builder("redis://localhost")
+        .failed_message_retry_strategy(
+            RetryStrategy::new().with_attempts(5)
+        )
+        .build()
+        .await?;
+    ```
+  </Tab>
+  
+  <Tab title="Custom - 10 attempts">
+    ```rust
+    // Chain multiple configurations
+    let strategy = RetryStrategy::new()
+        .with_attempts(10)
+        .retry_failed(true);
+    
+    let queue = BroccoliQueue::builder("redis://localhost")
+        .failed_message_retry_strategy(strategy)
+        .build()
+        .await?;
+    ```
+  </Tab>
+</Tabs>
+
+## Common Patterns
+
+### Pattern 1: Aggressive Retries for Critical Jobs
+
+```rust
+// Critical work should be retried many times
+let aggressive_strategy = RetryStrategy::new()
+    .with_attempts(10)
+    .retry_failed(true);
+
+let queue = BroccoliQueue::builder("redis://localhost")
+    .failed_message_retry_strategy(aggressive_strategy)
+    .build()
+    .await?;
+```
+
+### Pattern 2: No Retries for Fire-and-Forget
+
+```rust
+// Messages fail once and go to failed queue
+let no_retry_strategy = RetryStrategy::new()
+    .retry_failed(false);
+
+let queue = BroccoliQueue::builder("redis://localhost")
+    .failed_message_retry_strategy(no_retry_strategy)
+    .build()
+    .await?;
+```
+
+### Pattern 3: Conservative - Limited Retries
+
+```rust
+// Conservative approach: 2 attempts only
+let conservative_strategy = RetryStrategy::new()
+    .with_attempts(2);
+
+let queue = BroccoliQueue::builder("redis://localhost")
+    .failed_message_retry_strategy(conservative_strategy)
+    .build()
+    .await?;
+```
+
+### Pattern 4: Using Builder Method
+
+```rust
+// Full builder pattern
+let queue = BroccoliQueue::builder("redis://localhost")
+    .failed_message_retry_strategy(
+        RetryStrategy::new()
+            .with_attempts(7)
+            .retry_failed(true)
+    )
+    .pool_connections(10)
+    .build()
+    .await?;
+```
+
+## Integration with Handlers
+
+The retry strategy automatically applies to all handlers:
+
+```rust
+#[derive(Clone, Serialize, Deserialize)]
+struct EmailTask {
+    recipient: String,
+    subject: String,
+}
+
+let queue = BroccoliQueue::builder("redis://localhost")
+    .failed_message_retry_strategy(RetryStrategy::new().with_attempts(5))
+    .build()
+    .await?;
+
+queue.process_messages("emails", None, None, |msg: BrokerMessage<EmailTask>| async move {
+    match send_email(&msg.payload).await {
+        Ok(_) => {
+            println!("Email sent successfully");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Email failed (attempt {}): {}", msg.attempts + 1, e);
+            // RetryStrategy will automatically retry up to 5 times
+            Err(BroccoliError::Job(e.to_string()))
+        }
+    }
+}).await?;
+```
+
+## Queue Organization
+
+Messages flow between queues based on the retry strategy:
+
+<Expandable title="Queue Flow">
+  ```
+  main_queue
+      ↓ (consume)
+      ↓ (handler fails)
+  if attempts < limit && retry_failed:
+      ↓ (reject - increment attempts)
+      ↓
+  main_queue (retried)
+  
+  else if attempts >= limit:
+      ↓ (reject)
+      ↓
+  {topic}_failed (permanent)
+  
+  else if !retry_failed:
+      ↓ (reject immediately)
+      ↓
+  {topic}_failed (permanent)
+  ```
+</Expandable>
+
+<Tip>
+  The retry strategy is set once during queue creation and applies to all messages processed by that queue instance. Different use cases may require different queue instances with different strategies.
+</Tip>
+
+## Error Handling with Retries
+
+In handlers, you can check the attempt count and handle accordingly:
+
+```rust
+queue.process_messages("tasks", None, None, |msg: BrokerMessage<Task>| async move {
+    match process_task(&msg.payload).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            match msg.attempts {
+                0 => {
+                    // First attempt failed - log and retry
+                    log::warn!("Task failed on first attempt: {}", e);
+                    Err(BroccoliError::Job(e.to_string()))
+                }
+                1..=3 => {
+                    // Middle attempts - log with warning level
+                    log::warn!("Task failed on attempt {}: {}", msg.attempts + 1, e);
+                    Err(BroccoliError::Job(e.to_string()))
+                }
+                4.. => {
+                    // Final attempts - log with error level
+                    log::error!("Task failed on final attempt {}: {}", msg.attempts + 1, e);
+                    Err(BroccoliError::Job(e.to_string()))
+                }
+            }
+        }
+    }
+}).await?;
+```
+
+## Performance Considerations
+
+<Note>
+  Retries increase processing time and broker load. Consider:
+  - **High retry counts** increase latency and resource usage
+  - **Transient failures** (network, timeouts) benefit from retries
+  - **Permanent failures** (invalid data) should not retry — either validate before publishing or skip retries
+  - **External service failures** may need exponential backoff (implement in handler)
+</Note>
+
+## When to Use Each Configuration
+
+| Scenario | Configuration | Reason |
+|----------|---------------|--------|
+| Critical jobs (payments, orders) | `RetryStrategy::new().with_attempts(10)` | Important work deserves multiple retries |
+| Fast fire-and-forget tasks | `RetryStrategy::new().retry_failed(false)` | No need to retry non-critical work |
+| Normal processing | `RetryStrategy::default()` | 3 attempts is reasonable middle ground |
+| External API calls | `RetryStrategy::new().with_attempts(5)` | APIs are often transient-failure prone |
+| Data validation errors | `RetryStrategy::new().retry_failed(false)` | Invalid data won't become valid by retrying |
