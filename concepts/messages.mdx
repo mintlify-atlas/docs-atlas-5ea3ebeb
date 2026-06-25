@@ -1,7 +1,7 @@
 ---
 title: "Messages: Payload Wrappers with Lifecycle Tracking"
 sidebarTitle: "Messages"
-description: "Explore BrokerMessage structure, payload serialization, message identity with UUIDs, and state tracking."
+description: "Explore BrokerMessage structure, public fields, payload serialization, message identity with UUIDs, retry attempt tracking, and state transitions."
 ---
 
 Every message in Broccoli is wrapped in a `BrokerMessage<T>` envelope that pairs your payload with metadata for lifecycle tracking. This structure ensures each message can be uniquely identified, retried correctly, and routed fairly across consumers.
@@ -12,11 +12,10 @@ Every message in Broccoli is wrapped in a `BrokerMessage<T>` envelope that pairs
 
 ```rust
 pub struct BrokerMessage<T: Clone> {
-    pub task_id: uuid::Uuid,                      // Unique UUID v4 identifier
-    pub payload: T,                                // Your message data
-    pub attempts: u8,                              // Number of retry attempts made
-    pub disambiguator: Option<String>,             // Optional fairness key
-    pub metadata: Option<HashMap<String, MetadataTypes>>,  // Internal metadata
+    pub task_id: uuid::Uuid,           // Unique UUID v4 identifier
+    pub payload: T,                    // Your message data
+    pub attempts: u8,                  // Number of retry attempts made
+    pub disambiguator: Option<String>, // Optional fairness key
 }
 ```
 
@@ -28,7 +27,6 @@ pub struct BrokerMessage<T: Clone> {
 | `payload` | `T` | Your custom message type (must implement `Clone + Serialize + DeserializeOwned`) |
 | `attempts` | `u8` | Counter for retry attempts, starts at 0 |
 | `disambiguator` | `Option<String>` | Optional key for fairness routing (e.g., tenant ID, user ID) |
-| `metadata` | `Option<HashMap>` | Internal state for priority, TTL, etc. |
 
 ## Payload Type Requirements
 

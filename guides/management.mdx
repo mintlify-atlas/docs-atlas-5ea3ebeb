@@ -1,7 +1,7 @@
 ---
-title: Queue Management and Monitoring
+title: Queue Management and Monitoring with Broccoli Queue
 sidebarTitle: Management
-description: Monitor queue health, inspect message counts, and track processing state using management APIs.
+description: Monitor queue health, inspect message depths, and track processing state in Broccoli Queue using the optional management feature and its APIs.
 ---
 
 The management API provides visibility into queue status and message processing. This feature is optional and requires the `management` Cargo feature.
@@ -12,7 +12,7 @@ Add the management feature to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-broccoli_queue = { version = "0.1", features = ["management"] }
+broccoli_queue = { version = "0.4.6", features = ["management"] }
 ```
 
 With the feature enabled, `BroccoliQueue` gains two new methods: `queue_status()` and `size()`.

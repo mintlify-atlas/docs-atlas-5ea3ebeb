@@ -1,7 +1,7 @@
 ---
 title: "Fairness: Round-Robin Consumption Across Producers"
 sidebarTitle: "Fairness"
-description: "Enable fair message distribution to prevent producer starvation using disambiguators and round-robin cycling."
+description: "Enable fair message distribution using disambiguators and round-robin cycling to prevent producer starvation in multi-tenant and per-user queue scenarios."
 ---
 
 Fairness queuing prevents resource starvation in multi-producer scenarios. When enabled, Broccoli routes messages from different producers into separate sub-queues and cycles through them fairly, ensuring no single producer dominates consumer attention. This is essential for multi-tenant systems, per-user rate limiting, and priority partitioning.
@@ -10,7 +10,7 @@ Fairness queuing prevents resource starvation in multi-producer scenarios. When 
 
 Without fairness, a high-volume producer can flood the queue, starving low-volume producers:
 
-```
+```text
 Without Fairness:
 Queue: [User-A msg 1] [User-A msg 2] ... [User-A msg 100] [User-B msg 1]
                      ↑ User-B's single message buried under User-A's 100 messages
@@ -41,7 +41,7 @@ queue.publish(
 
 Broccoli creates per-disambiguator sub-queues:
 
-```
+```text
 {topic}_{disambiguator}_queue    // e.g., notifications_user-123_queue
 {topic}_{disambiguator}_queue    // e.g., notifications_user-456_queue
 ```
@@ -65,7 +65,7 @@ let msg3 = queue.consume("notifications", Some(consume_opts.clone())).await?;
 
 Result:
 
-```
+```text
 With Fairness:
 Queue 1 (user-123): [msg 1] → [msg 2] → [msg 3] ...
 Queue 2 (user-456): [msg 1] → [msg 2] → [msg 3] ...
@@ -157,7 +157,7 @@ let msg = queue.consume::<JobPayload>("jobs", Some(consume_opts)).await?;
 
 When you publish with a disambiguator, Broccoli creates:
 
-```
+```text
 {topic}_fairness_set          // Set of all active disambiguators
 {topic}_fairness_round_robin  // List tracking current position
 {topic}_{disambiguator}_queue        // Sorted queue for this disambiguator
@@ -167,22 +167,13 @@ When you publish with a disambiguator, Broccoli creates:
 
 Example for topic="jobs":
 
-```
+```text
 jobs_fairness_set              // Contains: "tenant-abc", "tenant-xyz", ...
 jobs_fairness_round_robin      // Current index: 0, 1, 2, ...
 jobs_tenant-abc_queue          // [msg1, msg2, msg3]
 jobs_tenant-xyz_queue          // [msg1, msg2]
 jobs_tenant-abc_processing     // []
 jobs_tenant-xyz_processing     // []
-```
-
-## Fairness Feature Flag
-
-Fairness queuing is gated behind the `test-fairness` feature flag for testing:
-
-```toml
-[dependencies]
-broccoli_queue = { version = "0.1", features = ["redis", "test-fairness"] }
 ```
 
 <Info>
@@ -362,7 +353,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 ```
 
 Output:
-```
+```text
 Published: Work item 0 from tenant-a
 Published: Work item 1 from tenant-b
 Published: Work item 2 from tenant-a

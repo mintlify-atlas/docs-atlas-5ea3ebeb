@@ -1,10 +1,10 @@
 ---
-title: "BrokerMessage: Generic Message Wrapper Type"
+title: "BrokerMessage<T>: Generic Message Wrapper for Broccoli"
 sidebarTitle: "BrokerMessage"
-description: "Type-safe generic wrapper for broker messages with UUID tracking, retry counting, and fairness routing support."
+description: "Type-safe generic wrapper for queue messages with automatic UUID generation, attempt tracking, and optional fairness-based routing via a disambiguator key."
 ---
 
-The `BrokerMessage<T>` is a generic type that wraps message payloads with metadata for tracking and processing. It provides type safety, automatic UUID generation, attempt tracking, and support for fairness-based routing.
+The `BrokerMessage<T>` is a generic type that wraps message payloads with tracking metadata for processing. It provides type safety, automatic UUID generation, attempt counting, and support for fairness-based routing.
 
 ## Overview
 
@@ -19,6 +19,10 @@ pub struct BrokerMessage<T: Clone> {
     pub disambiguator: Option<String>,
 }
 ```
+
+<Note>
+  The `metadata` field exists internally on `BrokerMessage` but is `pub(crate)` — it is not part of the public API and cannot be accessed from outside the library.
+</Note>
 
 ## Type Parameters
 
@@ -41,7 +45,7 @@ pub struct BrokerMessage<T: Clone> {
 </ResponseField>
 
 <ResponseField name="disambiguator" type="Option<String>">
-  Optional routing key for fairness-based queue distribution. When set, messages are routed to queue-specific buckets to ensure fair processing across different clients or users. Used with fairness queues in Redis broker.
+  Optional routing key for fairness-based queue distribution. When set, messages are routed to queue-specific buckets to ensure fair processing across different clients or users. Used with fairness queues in the Redis broker.
 </ResponseField>
 
 ## Constructor
@@ -57,10 +61,10 @@ impl<T: Clone + Serialize> BrokerMessage<T> {
 ```
 
 **Parameters:**
-- `payload` - Your message data
-- `disambiguator` - Optional fairness routing key
+- `payload` — Your message data
+- `disambiguator` — Optional fairness routing key
 
-**Returns:** A new `BrokerMessage<T>` with `task_id` auto-generated as UUID v4, `attempts` set to 0
+**Returns:** A new `BrokerMessage<T>` with `task_id` auto-generated as UUID v4 and `attempts` set to `0`.
 
 **Example:**
 
@@ -102,7 +106,7 @@ queue.process_messages("jobs", None, None, |message: BrokerMessage<JobPayload>| 
     // Access fields directly
     println!("Task ID: {}", message.task_id);
     println!("Attempts so far: {}", message.attempts);
-    
+
     // Use the payload
     let job = message.payload;
     match process_job(&job).await {
@@ -156,49 +160,45 @@ queue.publish(
 // Messages are queued separately by disambiguator value
 ```
 
-<Note>
-  The `metadata` field exists on `BrokerMessage` but is crate-private (`pub(crate)`). It is not part of the public API and should not be accessed from outside the library.
-</Note>
-
 ## Related Types
 
 ### QueueType
 
-Represents the category of queue a message may be in:
+Represents the category of queue a message may be in (requires the `management` feature):
 
 <ResponseField name="QueueType" type="enum">
-  - `Main` - Primary processing queue
-  - `Processing` - Messages currently being handled
-  - `Failed` - Messages that exceeded retry attempts
-  - `Fairness` - Fair-distribution queue for disambiguated routing
+  - `Main` — Primary processing queue
+  - `Processing` — Messages currently being handled
+  - `Failed` — Messages that exceeded retry attempts
+  - `Fairness` — Fair-distribution queue for disambiguated routing
 </ResponseField>
 
 ### QueueStatus
 
-Contains information about queue state when inspecting queues with the management feature:
+Contains information about queue state when inspecting queues with the `management` feature:
 
 <ResponseField name="name" type="String">
-  The queue name
+  The queue name.
 </ResponseField>
 
 <ResponseField name="queue_type" type="QueueType">
-  The type of queue
+  The type of queue.
 </ResponseField>
 
 <ResponseField name="size" type="usize">
-  Number of pending messages
+  Number of pending messages.
 </ResponseField>
 
 <ResponseField name="processing" type="usize">
-  Number of messages currently being processed
+  Number of messages currently being processed.
 </ResponseField>
 
 <ResponseField name="failed" type="usize">
-  Number of messages in the failed queue
+  Number of messages in the failed queue.
 </ResponseField>
 
 <ResponseField name="disambiguator_count" type="Option<usize>">
-  For fairness queues, the number of distinct disambiguator values
+  For fairness queues, the number of distinct disambiguator values.
 </ResponseField>
 
 ## Batch Operations

@@ -1,7 +1,7 @@
 ---
-title: "BroccoliQueueBuilder — Queue Configuration"
+title: "BroccoliQueueBuilder — Queue Configuration and Setup"
 sidebarTitle: "QueueBuilder"
-description: "Fluent builder interface for configuring BroccoliQueue with connection pooling, retry strategy, and scheduling settings."
+description: "Fluent builder interface for constructing a BroccoliQueue with connection pooling, retry strategy, and scheduled message delivery settings."
 ---
 
 The `BroccoliQueueBuilder` struct provides a fluent builder pattern for configuring and constructing a `BroccoliQueue` instance. It allows you to set connection pool size, retry behavior, and message scheduling options before building the queue.
@@ -44,7 +44,7 @@ When using `new_with_surrealdb`, the broker URL is not used (set to a placeholde
 Configures how failed messages should be retried.
 
 ```rust
-pub fn failed_message_retry_strategy(mut self, strategy: RetryStrategy) -> Self
+pub const fn failed_message_retry_strategy(self, strategy: RetryStrategy) -> Self
 ```
 
 <ParamField path="strategy" type="RetryStrategy">
@@ -97,7 +97,7 @@ let queue = BroccoliQueue::builder("redis://localhost:6379")
 Configures the number of broker connections to maintain in the connection pool.
 
 ```rust
-pub fn pool_connections(mut self, connections: u8) -> Self
+pub const fn pool_connections(self, connections: u8) -> Self
 ```
 
 <ParamField path="connections" type="u8">
@@ -138,7 +138,7 @@ let queue = BroccoliQueue::builder("redis://localhost:6379")
 Enables or disables delayed and scheduled message delivery.
 
 ```rust
-pub fn enable_scheduling(mut self, enable_scheduling: bool) -> Self
+pub const fn enable_scheduling(self, enable_scheduling: bool) -> Self
 ```
 
 <ParamField path="enable_scheduling" type="bool">

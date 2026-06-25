@@ -34,25 +34,12 @@ broccoli_queue = "0.4"  # redis enabled by default
 
 ## Connection URLs
 
-Broccoli Queue supports multiple Redis URL schemes:
+Broccoli Queue accepts any URL whose scheme starts with `redis`. The most common format is:
 
-<CodeGroup>
 ```
 redis://localhost:6379
-```
-
-```
 redis://user:password@localhost:6379
 ```
-
-```
-rediss://user:password@localhost:6379  # TLS
-```
-
-```
-redis+sentinel://
-```
-</CodeGroup>
 
 ## Quick Start
 
@@ -60,32 +47,28 @@ redis+sentinel://
   <Step title="Create a queue instance">
     <CodeGroup>
     ```rust Basic Setup
-    use broccoli_queue::{BroccoliQueue, brokers::broker::BrokerConfig};
+    use broccoli_queue::BroccoliQueue;
 
     #[tokio::main]
     async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let queue = BroccoliQueue::builder("redis://localhost:6379")
-            .build::<String>()
+            .build()
             .await?;
         Ok(())
     }
     ```
 
     ```rust With Configuration
-    use broccoli_queue::{BroccoliQueue, brokers::broker::BrokerConfig};
-
-    let config = BrokerConfig {
-        pool_connections: Some(20),
-        retry_attempts: Some(5),
-        retry_failed: Some(true),
-        enable_scheduling: Some(true),
-        #[cfg(feature = "surrealdb")]
-        surrealdb_connection: None,
-    };
+    use broccoli_queue::BroccoliQueue;
+    use broccoli_queue::queue::RetryStrategy;
 
     let queue = BroccoliQueue::builder("redis://localhost:6379")
-        .with_broker_config(config)
-        .build::<String>()
+        .pool_connections(20)
+        .failed_message_retry_strategy(
+            RetryStrategy::new().with_attempts(5).retry_failed(true)
+        )
+        .enable_scheduling(true)
+        .build()
         .await?;
     ```
     </CodeGroup>
@@ -96,15 +79,16 @@ redis+sentinel://
     use broccoli_queue::queue::PublishOptions;
     use std::time::Duration;
 
-    queue.publish("my_queue", "Hello, Redis!", None).await?;
+    queue.publish("my_queue", None, &"Hello, Redis!", None).await?;
 
     // With priority and delay
     queue.publish(
         "my_queue",
-        "High priority task",
+        None,
+        &"High priority task",
         Some(PublishOptions {
             priority: Some(1),  // 1 = highest
-            delay: Some(Duration::from_secs(10)),
+            delay: Some(Duration::from_secs(10).try_into().unwrap()),
             ..Default::default()
         }),
     ).await?;
@@ -117,7 +101,7 @@ redis+sentinel://
     let message = queue.consume::<String>("my_queue", None).await?;
     println!("Received: {}", message.payload);
 
-    // Batch consumption
+    // Non-blocking batch consumption
     let messages = queue.try_consume_batch::<String>("my_queue", 10, None).await?;
     println!("Received {} messages", messages.len());
     ```
@@ -126,26 +110,25 @@ redis+sentinel://
   <Step title="Acknowledge or reject">
     ```rust
     // Success: acknowledge the message
-    queue.acknowledge("my_queue", &message).await?;
+    queue.acknowledge("my_queue", message).await?;
 
     // Failure: reject (will retry or move to failed queue)
-    queue.reject("my_queue", &message).await?;
+    queue.reject("my_queue", message).await?;
     ```
   </Step>
 </Steps>
 
 ## Configuration
 
-### BrokerConfig Options
+### Builder Options
 
-The Redis broker respects the following configuration parameters:
+The Redis broker is configured through the `BroccoliQueueBuilder` fluent API:
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `pool_connections` | `u8` | 10 | Maximum number of connections in the Redis connection pool |
-| `retry_attempts` | `u8` | 3 | Maximum number of retry attempts for failed messages |
-| `retry_failed` | `bool` | true | Whether to retry failed messages |
-| `enable_scheduling` | `bool` | false | Enable time-based message scheduling |
+| Builder Method | Default | Description |
+|----------------|---------|-------------|
+| `.pool_connections(N)` | 10 | Maximum number of connections in the Redis connection pool |
+| `.failed_message_retry_strategy(s)` | 3 attempts, retry enabled | Retry strategy for failed messages |
+| `.enable_scheduling(bool)` | false | Enable time-based message scheduling |
 
 <Note>
 For production deployments, consider increasing `pool_connections` based on your throughput requirements. Monitor Redis connection usage and adjust accordingly.
@@ -154,21 +137,18 @@ For production deployments, consider increasing `pool_connections` based on your
 ### Complete Configuration Example
 
 ```rust
-use broccoli_queue::{BroccoliQueue, brokers::broker::BrokerConfig};
-use std::time::Duration;
-
-let config = BrokerConfig {
-    pool_connections: Some(30),      // Increase for high throughput
-    retry_attempts: Some(5),          // More retries for critical tasks
-    retry_failed: Some(true),         // Always retry failed messages
-    enable_scheduling: Some(true),    // Enable message scheduling
-    #[cfg(feature = "surrealdb")]
-    surrealdb_connection: None,
-};
+use broccoli_queue::BroccoliQueue;
+use broccoli_queue::queue::RetryStrategy;
 
 let queue = BroccoliQueue::builder("redis://localhost:6379")
-    .with_broker_config(config)
-    .build::<MyMessageType>()
+    .pool_connections(30)           // Increase for high throughput
+    .failed_message_retry_strategy(
+        RetryStrategy::new()
+            .with_attempts(5)       // More retries for critical tasks
+            .retry_failed(true)     // Always retry failed messages
+    )
+    .enable_scheduling(true)        // Enable message scheduling
+    .build()
     .await?;
 ```
 
@@ -220,15 +200,14 @@ For fairness-enabled queues, separate sub-queues are maintained:
 ### Priority & Fairness Example
 
 ```rust
-// Fairness queuing: each "user" gets equal message processing
-let message = broccoli_queue::brokers::broker::BrokerMessage::new(
-    "task_data".to_string(),
-    Some("user_123".to_string()), // disambiguator
-);
+use broccoli_queue::queue::PublishOptions;
+use broccoli_queue::queue::ConsumeOptions;
 
-queue.publish_advanced(
+// Fairness queuing: each "user" gets equal message processing
+queue.publish(
     "tasks",
-    vec![message],
+    Some("user_123".to_string()), // disambiguator drives fairness
+    &"task_data",
     Some(PublishOptions {
         priority: Some(2),
         ..Default::default()
@@ -236,7 +215,7 @@ queue.publish_advanced(
 ).await?;
 
 // Consume with fairness enabled
-let msg = queue.consume_advanced::<String>(
+let msg = queue.consume::<String>(
     "tasks",
     Some(ConsumeOptions {
         fairness: Some(true),
@@ -282,9 +261,6 @@ volumes:
   </Card>
   <Card title="Authentication Failed">
     Check your URL format: `redis://user:password@host:port`
-  </Card>
-  <Card title="TLS Issues">
-    Use `rediss://` scheme for TLS connections and ensure certificates are properly configured
   </Card>
 </CardGroup>
 
@@ -341,14 +317,16 @@ For optimal performance:
 
 ### Connection Pool Tuning
 
-```rust
-let config = BrokerConfig {
-    pool_connections: Some(concurrent_workers as u8),
-    ..Default::default()
-};
-```
+Set `pool_connections` equal to or slightly higher than your number of concurrent workers:
 
-Recommendation: Set `pool_connections` equal to or slightly higher than your number of concurrent workers.
+```rust
+use broccoli_queue::BroccoliQueue;
+
+let queue = BroccoliQueue::builder("redis://localhost:6379")
+    .pool_connections(concurrent_workers)
+    .build()
+    .await?;
+```
 
 ## Troubleshooting
 

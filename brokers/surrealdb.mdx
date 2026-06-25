@@ -13,9 +13,8 @@ SurrealDB integration offers unique flexibility with the following characteristi
 - **Multiple Connection Modes**: URL-based remote, in-memory ephemeral, or existing database reuse
 - **Development-Friendly**: Perfect for testing without external broker dependencies
 - **Embedded-Ready**: Lightweight in-memory mode for applications bundled with their queue
-- **Flexible Storage**: Supports all SurrealDB storage engines (KV, S3, etc.)
 - **Native Scheduling**: Scheduled messages supported without plugins
-- **Existing Connection Reuse**: Pass an existing `surrealdb::Surreal` connection
+- **Existing Connection Reuse**: Pass an existing `surrealdb::Surreal` connection via `BroccoliQueue::builder_with`
 
 ## Installation
 
@@ -48,9 +47,9 @@ use broccoli_queue::BroccoliQueue;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Ephemeral in-memory queue—no persistence
     let queue = BroccoliQueue::builder("mem://")
-        .build::<String>()
+        .build()
         .await?;
-    
+
     // Queue is fully functional but lost on shutdown
     Ok(())
 }
@@ -63,29 +62,23 @@ Connect to a running SurrealDB server:
 <CodeGroup>
 ```rust Standard Connection
 let queue = BroccoliQueue::builder("ws://localhost:8000")
-    .build::<String>()
-    .await?;
-```
-
-```rust With Credentials
-let queue = BroccoliQueue::builder("ws://user:pass@localhost:8000")
-    .build::<String>()
+    .build()
     .await?;
 ```
 
 ```rust TLS Connection
 let queue = BroccoliQueue::builder("wss://localhost:8000")
-    .build::<String>()
+    .build()
     .await?;
 ```
 </CodeGroup>
 
 ### 3. Reuse Existing Connection
 
-Pass an existing SurrealDB connection directly:
+Pass an existing SurrealDB connection directly using `BroccoliQueue::builder_with`:
 
 ```rust
-use broccoli_queue::{BroccoliQueue, brokers::broker::BrokerConfig};
+use broccoli_queue::BroccoliQueue;
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 
@@ -93,20 +86,14 @@ use surrealdb::engine::any::Any;
 let db: Surreal<Any> = Surreal::new::<Any>("mem://").await?;
 db.use_ns("app").use_db("mydb").await?;
 
-// Reuse connection in Broccoli
-let config = BrokerConfig {
-    surrealdb_connection: Some(db),
-    ..Default::default()
-};
-
-let queue = BroccoliQueue::builder("ws://unused")  // URL is ignored when connection provided
-    .with_broker_config(config)
-    .build::<String>()
+// Reuse connection in Broccoli — no URL needed
+let queue = BroccoliQueue::builder_with(db)
+    .build()
     .await?;
 ```
 
 <Tip>
-When using `builder_with`, the URL passed to `builder()` is ignored—the connection from `BrokerConfig` takes priority. Use any placeholder URL like `ws://unused`.
+`BroccoliQueue::builder_with(db)` is a SurrealDB-only constructor that takes your existing `Surreal<Any>` connection directly. The broker URL is set automatically; there is no need to pass a placeholder URL.
 </Tip>
 
 ## Quick Start
@@ -116,7 +103,7 @@ When using `builder_with`, the URL passed to `builder()` is ignored—the connec
     ```rust
     // For testing: in-memory
     let url = "mem://";
-    
+
     // For production: remote server
     let url = "ws://localhost:8000";
     ```
@@ -127,14 +114,14 @@ When using `builder_with`, the URL passed to `builder()` is ignored—the connec
     use broccoli_queue::BroccoliQueue;
 
     let queue = BroccoliQueue::builder(url)
-        .build::<String>()
+        .build()
         .await?;
     ```
   </Step>
 
   <Step title="Publish messages">
     ```rust
-    queue.publish("tasks", "Process this", None).await?;
+    queue.publish("tasks", None, &"Process this", None).await?;
     ```
   </Step>
 
@@ -143,7 +130,7 @@ When using `builder_with`, the URL passed to `builder()` is ignored—the connec
     match queue.consume::<String>("tasks", None).await {
         Ok(msg) => {
             println!("Got: {}", msg.payload);
-            queue.acknowledge("tasks", &msg).await?;
+            queue.acknowledge("tasks", msg).await?;
         }
         Err(e) => {
             eprintln!("Error: {:?}", e);
@@ -156,31 +143,27 @@ When using `builder_with`, the URL passed to `builder()` is ignored—the connec
 
 ## Configuration
 
-### BrokerConfig Options
+### Builder Options
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `pool_connections` | `u8` | 10 | Connection pool size (for remote mode) |
-| `retry_attempts` | `u8` | 3 | Max retry attempts for failed messages |
-| `retry_failed` | `bool` | true | Whether to retry failed messages |
-| `enable_scheduling` | `bool` | false | Enable time-based message scheduling |
-| `surrealdb_connection` | `Option<Surreal<Any>>` | None | Existing connection to reuse |
+The SurrealDB broker is configured through the `BroccoliQueueBuilder` fluent API:
+
+| Builder Method | Default | Description |
+|----------------|---------|-------------|
+| `.pool_connections(N)` | 10 | Connection pool size (for remote mode) |
+| `.failed_message_retry_strategy(s)` | 3 attempts, retry enabled | Retry strategy for failed messages |
+| `.enable_scheduling(bool)` | false | Enable time-based message scheduling |
 
 ```rust
-use broccoli_queue::{BroccoliQueue, brokers::broker::BrokerConfig};
-
-let config = BrokerConfig {
-    pool_connections: Some(5),
-    retry_attempts: Some(3),
-    retry_failed: Some(true),
-    enable_scheduling: Some(true),
-    #[cfg(feature = "surrealdb")]
-    surrealdb_connection: None,
-};
+use broccoli_queue::BroccoliQueue;
+use broccoli_queue::queue::RetryStrategy;
 
 let queue = BroccoliQueue::builder("ws://localhost:8000")
-    .with_broker_config(config)
-    .build::<MyMessage>()
+    .pool_connections(5)
+    .failed_message_retry_strategy(
+        RetryStrategy::new().with_attempts(3).retry_failed(true)
+    )
+    .enable_scheduling(true)
+    .build()
     .await?;
 ```
 
@@ -190,20 +173,15 @@ SurrealDB supports native scheduling without additional plugins:
 
 ```rust
 use broccoli_queue::queue::PublishOptions;
-use std::time::Duration;
-use time::OffsetDateTime;
-
-let config = BrokerConfig {
-    enable_scheduling: Some(true),
-    ..Default::default()
-};
+use time::{Duration, OffsetDateTime};
 
 // Delay message by 2 hours
 queue.publish(
     "reports",
-    "Generate monthly report",
+    None,
+    &"Generate monthly report",
     Some(PublishOptions {
-        delay: Some(Duration::from_secs(7200)),
+        delay: Some(Duration::hours(2)),
         ..Default::default()
     }),
 ).await?;
@@ -212,7 +190,8 @@ queue.publish(
 let next_week = OffsetDateTime::now_utc() + Duration::days(7);
 queue.publish(
     "reports",
-    "Generate weekly report",
+    None,
+    &"Generate weekly report",
     Some(PublishOptions {
         scheduled_at: Some(next_week),
         ..Default::default()
@@ -224,16 +203,17 @@ queue.publish(
 
 ### ⚠️ Non-Idempotent Operation Errors
 
-SurrealDB may return `BrokerNonIdempotentOp` or `BrokerNonIdempotentRetriableOp` errors when multiple concurrent readers access the same queue table:
+SurrealDB may return `BrokerNonIdempotentOp` errors on concurrent reads, or `BrokerNonIdempotentRetriableOp` on concurrent writes, when multiple consumers access the same queue table simultaneously:
 
 ```rust
 use broccoli_queue::error::BroccoliError;
+use std::time::Duration;
 
 loop {
     match queue.consume::<Message>("tasks", None).await {
         Ok(msg) => {
             // Process message
-            queue.acknowledge("tasks", &msg).await?;
+            queue.acknowledge("tasks", msg).await?;
         }
         Err(BroccoliError::Broker(msg)) if msg.contains("NonIdempotent") => {
             // Retry after brief delay
@@ -256,7 +236,7 @@ loop {
 let tasks = queue.try_consume_batch::<Message>("tasks", 10, None).await?;
 for task in tasks {
     // Process task
-    queue.acknowledge("tasks", &task).await?;
+    queue.acknowledge("tasks", task).await?;
 }
 ```
 
@@ -271,14 +251,15 @@ for task in tasks {
 - **Message Cancellation**: Remove messages before processing
 - **Message Scheduling**: Native support, no plugins needed
 - **In-Memory Mode**: Perfect for testing
-- **Existing Connection Reuse**: Leverage your existing SurrealDB setup
+- **Existing Connection Reuse**: Leverage your existing SurrealDB setup via `builder_with`
 
 ### ⚠️ Limitations
 
-- **No Fairness Queuing**: Different approach compared to Redis
+- **No Fairness Queuing**: Not supported; use Redis for fairness-based workloads
 - **Limited Concurrency**: Best with 2-4 concurrent readers
 - **Concurrency Errors**: May return `BrokerNonIdempotentOp` under high concurrent load
 - **No Queue Sizing**: Cannot retrieve current queue size via API
+- **No TTL Support**: `PublishOptions.ttl` returns `NotImplemented` for SurrealDB
 - **Performance**: Slower than Redis for high-throughput scenarios
 
 <Warning>
@@ -293,12 +274,12 @@ Do not use SurrealDB for high-concurrency scenarios requiring thousands of concu
 #[tokio::test]
 async fn test_queue_operations() {
     let queue = BroccoliQueue::builder("mem://")
-        .build::<String>()
+        .build()
         .await
         .expect("Failed to create queue");
 
-    queue.publish("test", "Hello", None).await.expect("Publish failed");
-    
+    queue.publish("test", None, &"Hello", None).await.expect("Publish failed");
+
     let msg = queue.consume::<String>("test", None).await.expect("Consume failed");
     assert_eq!(msg.payload, "Hello");
 }
@@ -355,10 +336,10 @@ mod tests {
     #[tokio::test]
     async fn test_message_flow() {
         let queue = BroccoliQueue::builder("mem://")
-            .build::<TestMessage>()
+            .build()
             .await
             .unwrap();
-        
+
         // Test without external dependencies
     }
 }
@@ -366,20 +347,18 @@ mod tests {
 
 ### 🚀 Embedded Deployments
 
-Bundle messaging with your application:
+Bundle messaging with your application using an existing SurrealDB connection:
 
 ```rust
+use broccoli_queue::BroccoliQueue;
+use surrealdb::Surreal;
+use surrealdb::engine::any::Any;
+
 // Single-binary deployment with embedded SurrealDB queue
-let db = surrealdb::Surreal::new::<Any>("mem://").await?;
+let db: Surreal<Any> = Surreal::new::<Any>("mem://").await?;
 
-let config = BrokerConfig {
-    surrealdb_connection: Some(db),
-    ..Default::default()
-};
-
-let queue = BroccoliQueue::builder("ws://unused")
-    .with_broker_config(config)
-    .build::<String>()
+let queue = BroccoliQueue::builder_with(db)
+    .build()
     .await?;
 ```
 
@@ -388,18 +367,14 @@ let queue = BroccoliQueue::builder("ws://unused")
 Integrate with your SurrealDB application:
 
 ```rust
+use broccoli_queue::BroccoliQueue;
+
 // Your existing SurrealDB connection
 let my_db: Surreal<Any> = /* ... */;
 
 // Reuse for messaging
-let config = BrokerConfig {
-    surrealdb_connection: Some(my_db.clone()),
-    ..Default::default()
-};
-
-let queue = BroccoliQueue::builder("ws://unused")
-    .with_broker_config(config)
-    .build::<MyMessage>()
+let queue = BroccoliQueue::builder_with(my_db)
+    .build()
     .await?;
 ```
 
@@ -408,42 +383,35 @@ let queue = BroccoliQueue::builder("ws://unused")
 SurrealDB uses relational tables for queue management:
 
 <Accordion title="Internal Table Architecture">
-  <div>
-    <h4>Message Table: `{queue_name}`</h4>
-    <ul>
-      <li><code>id</code>: Record ID (unique message identifier)</li>
-      <li><code>task_id</code>: UUID for external reference</li>
-      <li><code>payload</code>: JSON message content</li>
-      <li><code>attempts</code>: Number of processing attempts</li>
-      <li><code>created_at</code>: Timestamp</li>
-    </ul>
+**Message Table: `{queue_name}`**
 
-    <h4>Queue Index Table: `{queue_name}_queue`</h4>
-    <ul>
-      <li><code>priority</code>: Message priority (1-5)</li>
-      <li><code>timestamp</code>: Creation time</li>
-      <li><code>message_id</code>: Reference to message table</li>
-    </ul>
+- `id` — Record ID (unique message identifier)
+- `task_id` — UUID for external reference
+- `payload` — JSON message content
+- `attempts` — Number of processing attempts
+- `created_at` — Timestamp
 
-    <h4>Processing Queue Table: `{queue_name}_processing`</h4>
-    <ul>
-      <li><code>id</code>: Reference to queued message</li>
-      <li><code>locked_until</code>: Processing timeout</li>
-    </ul>
+**Queue Index Table: `{queue_name}_queue`**
 
-    <h4>Failed Messages Table: `{queue_name}_failed`</h4>
-    <ul>
-      <li><code>original_id</code>: Original task ID</li>
-      <li><code>original_msg</code>: Full original message</li>
-      <li><code>failed_at</code>: Failure timestamp</li>
-    </ul>
+- `priority` — Message priority (1–5)
+- `timestamp` — Creation time
+- `message_id` — Reference to message table
 
-    <h4>Scheduled Messages Table: `{queue_name}_scheduled`</h4>
-    <ul>
-      <li><code>scheduled_for</code>: Delivery time</li>
-      <li><code>message_id</code>: Reference to message</li>
-    </ul>
-  </div>
+**Processing Queue Table: `{queue_name}_processing`**
+
+- `id` — Reference to queued message
+- `locked_until` — Processing timeout
+
+**Failed Messages Table: `{queue_name}_failed`**
+
+- `original_id` — Original task ID
+- `original_msg` — Full original message
+- `failed_at` — Failure timestamp
+
+**Scheduled Messages Table: `{queue_name}_scheduled`**
+
+- `scheduled_for` — Delivery time
+- `message_id` — Reference to message
 </Accordion>
 
 ## Error Handling
@@ -458,9 +426,9 @@ loop {
     match queue.consume::<Message>("tasks", None).await {
         Ok(msg) => {
             if process_message(&msg).await.is_ok() {
-                queue.acknowledge("tasks", &msg).await?;
+                queue.acknowledge("tasks", msg).await?;
             } else {
-                queue.reject("tasks", &msg).await?;
+                queue.reject("tasks", msg).await?;
             }
         }
         Err(BroccoliError::Broker(e)) if e.contains("NonIdempotent") => {
@@ -497,13 +465,11 @@ Use in-memory mode for tests and file backend for local development. Remote WebS
   Reduce concurrent consumers:
   ```rust
   // Bad: Too many concurrent consumers
-  let tasks = tokio::join_all(
-      vec![1..100].iter().map(|_| queue.consume("q", None))
-  ).await;
+  // Don't spawn hundreds of concurrent consume calls
 
   // Good: Limited concurrency
   for _ in 0..4 {
-      let msg = queue.consume("q", None).await?;
+      let msg = queue.consume::<String>("q", None).await?;
   }
   ```
 </Accordion>
@@ -516,11 +482,9 @@ Use in-memory mode for tests and file backend for local development. Remote WebS
 </Accordion>
 
 <Accordion title="Cannot connect to remote SurrealDB">
-  <ul>
-    <li>Verify server is running: `curl http://localhost:8000/health`</li>
-    <li>Check connection URL includes credentials if required</li>
-    <li>Ensure network connectivity</li>
-  </ul>
+- Verify server is running: `curl http://localhost:8000/health`
+- Check connection URL includes credentials if required
+- Ensure network connectivity
 </Accordion>
 
 <Accordion title="High memory usage with in-memory backend">
@@ -530,7 +494,7 @@ Use in-memory mode for tests and file backend for local development. Remote WebS
 ## Comparing Backends
 
 | Feature | Redis | RabbitMQ | SurrealDB |
-|---------|-------|----------|-----------|
+|---------|-------|----------|-----------| 
 | Fairness Queuing | ✅ Full | ❌ No | ❌ No |
 | Scheduling | ✅ Native | ⚠️ Plugin | ✅ Native |
 | In-Memory Mode | ❌ No | ❌ No | ✅ Yes |

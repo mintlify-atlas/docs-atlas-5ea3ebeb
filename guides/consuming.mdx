@@ -1,7 +1,7 @@
 ---
-title: Consuming and Processing Messages
+title: Consuming and Processing Messages with Broccoli Queue
 sidebarTitle: Consuming
-description: Master message consumption patterns from blocking to concurrent processing with automatic acknowledgment and error handling.
+description: Master message consumption patterns in Broccoli Queue, from blocking to concurrent processing with automatic acknowledgment and error handling.
 ---
 
 Broccoli Queue provides multiple consumption patterns to fit different application needs, from simple blocking consumption to highly concurrent worker pools with custom callbacks.
@@ -147,8 +147,9 @@ For most applications, use `process_messages()` to run a worker loop with automa
 
 ```rust
 use broccoli_queue::queue::{BroccoliQueue, ConsumeOptions};
+use broccoli_queue::error::BroccoliError;
 
-async fn process_job(msg: JobPayload) -> Result<(), Box<dyn std::error::Error>> {
+async fn process_job(msg: JobPayload) -> Result<(), BroccoliError> {
     println!("Processing: {}", msg.id);
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     Ok(())
@@ -164,9 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(4),  // concurrency
         None,     // consume options
         |msg| async move {
-            process_job(msg.payload).await.map_err(|e| {
-                broccoli_queue::error::BroccoliError::Job(e.to_string())
-            })
+            process_job(msg.payload).await
         },
     ).await?;
 

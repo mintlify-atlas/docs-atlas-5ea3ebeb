@@ -1,7 +1,7 @@
 ---
-title: "Brokers: Backend Storage and Transport Layer"
+title: "Broccoli Brokers: Redis, RabbitMQ, and SurrealDB Backends"
 sidebarTitle: "Brokers"
-description: "Explore Redis, RabbitMQ, and SurrealDB broker implementations, selection, pooling, and configuration."
+description: "Explore Redis, RabbitMQ, and SurrealDB broker implementations, automatic URL-based selection, connection pooling, and broker configuration defaults."
 ---
 
 Brokers are the backend storage and transport layer for Broccoli. They implement the `Broker` trait and handle queue operations, connection pooling, and persistence. Broccoli supports three backends: Redis, RabbitMQ, and SurrealDB, with automatic selection based on your connection URL scheme.
@@ -152,7 +152,7 @@ let queue = BroccoliQueue::builder_with(db).build().await?;
 
 ## Broker Configuration
 
-Configure broker behavior via `BrokerConfig`:
+Configure broker behavior using builder methods on `BroccoliQueueBuilder`. The builder translates these settings into a `BrokerConfig` internally:
 
 ```rust
 use broccoli_queue::queue::{BroccoliQueue, RetryStrategy};
@@ -184,24 +184,24 @@ Enable brokers via Cargo.toml:
 
 ```toml
 [dependencies]
-broccoli_queue = { version = "0.1", features = ["redis"] }
+broccoli_queue = { version = "0.4", features = ["redis"] }
 ```
 
 ```toml
 [dependencies]
-broccoli_queue = { version = "0.1", features = ["rabbitmq"] }
+broccoli_queue = { version = "0.4", features = ["rabbitmq"] }
 ```
 
 ```toml
 [dependencies]
-broccoli_queue = { version = "0.1", features = ["surrealdb"] }
+broccoli_queue = { version = "0.4", features = ["surrealdb"] }
 ```
 
 Use multiple brokers in the same application:
 
 ```toml
 [dependencies]
-broccoli_queue = { version = "0.1", features = ["redis", "rabbitmq"] }
+broccoli_queue = { version = "0.4", features = ["redis", "rabbitmq"] }
 ```
 
 ## Broker Comparison
@@ -298,7 +298,7 @@ loop {
 ```
 
 Output example:
-```
+```text
 orders: 150 messages
 orders_processing: 12 messages
 orders_failed: 3 messages

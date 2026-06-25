@@ -1,7 +1,7 @@
 ---
-title: "Install and Configure Broccoli for Your Broker"
+title: "Install and Configure Broccoli Queue for Your Broker"
 sidebarTitle: "Installation"
-description: "Add Broccoli to your Cargo.toml, choose your broker backend, and configure connection URLs for Redis, RabbitMQ, or SurrealDB."
+description: "Add Broccoli to your Cargo.toml, choose your broker backend, and configure connection URLs for Redis, RabbitMQ, or SurrealDB in Rust."
 ---
 
 **Install Broccoli and configure your message broker backend.** The library supports Redis (default), RabbitMQ, and SurrealDB, with flexible feature flags for minimal dependencies.
@@ -226,7 +226,7 @@ serde_json = "1.0"
 
 <Tabs>
   <Tab title="Redis">
-    ```
+    ```text
     redis://localhost:6379                    # Default local
     redis://username:password@host:6379       # With auth
     redis://host:port/db_number               # With database selection
@@ -239,7 +239,7 @@ serde_json = "1.0"
   </Tab>
 
   <Tab title="RabbitMQ">
-    ```
+    ```text
     amqp://localhost:5672                     # Default local
     amqp://guest:guest@localhost:5672         # With credentials
     amqp://user:pass@host:5672/vhost          # With virtual host
@@ -252,7 +252,7 @@ serde_json = "1.0"
   </Tab>
 
   <Tab title="SurrealDB">
-    ```
+    ```text
     ws://localhost:8000                       # Remote WebSocket
     mem://                                    # In-memory (testing)
     ws://user:pass@host:port                  # With credentials

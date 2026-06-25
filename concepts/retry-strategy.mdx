@@ -1,7 +1,7 @@
 ---
 title: "Retry Strategy: Failed Message Handling and Recovery"
 sidebarTitle: "Retry Strategy"
-description: "Configure retry attempts, enable/disable retries, and manage messages that exhaust retries."
+description: "Configure RetryStrategy to set maximum retry attempts, enable or disable retries, and manage messages that exhaust all attempts in the failed queue."
 ---
 
 `RetryStrategy` controls how Broccoli handles messages that fail during processing. It defines the maximum number of retry attempts and whether to retry failed messages at all. When a message exhausts its retries, it moves to the failed queue for later inspection or manual recovery.
@@ -232,7 +232,7 @@ The `task_id` and `payload` remain constant; only `attempts` increases.
 
 When a message exhausts its retry attempts, it moves to the failed queue:
 
-```
+```text
 {topic}_failed              // Unfair mode
 {topic}_{disambiguator}_failed  // Fairness mode
 ```

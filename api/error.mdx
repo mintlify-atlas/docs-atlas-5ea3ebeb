@@ -1,7 +1,7 @@
 ---
-title: "BroccoliError: Error Types and Handling"
+title: "BroccoliError: Unified Error Type for All Queue Operations"
 sidebarTitle: "BroccoliError"
-description: "Comprehensive error enum for all Broccoli message queue operations with recovery guidance."
+description: "Complete reference for BroccoliError, the unified error enum returned by every Broccoli operation, with variant descriptions and recovery guidance."
 ---
 
 `BroccoliError` is the unified error type returned by all Broccoli operations. It implements `std::error::Error` via the `thiserror` crate, providing ergonomic error handling and display formatting.
@@ -19,502 +19,501 @@ All async operations in Broccoli return `Result<T, BroccoliError>`. The error va
 ## Error Variants
 
 <Accordion title="Broker Errors">
-  
-  ### Broker(String)
-  
-  General broker operation error.
-  
-  ```rust
-  #[error("Broker error: {0}")]
-  Broker(String)
-  ```
-  
-  **When it occurs:**
-  - Broker connection failures
-  - Connection pool initialization errors
-  - Broker-specific protocol errors
-  
-  **How to handle:**
-  ```rust
-  match queue.consume("topic", None).await {
-      Ok(msg) => { /* process */ },
-      Err(BroccoliError::Broker(msg)) => {
-          eprintln!("Broker error: {}", msg);
-          // Possibly retry queue creation or check broker availability
-      }
-      _ => { /* other errors */ }
-  }
-  ```
-  
-  ---
-  
-  ### BrokerNonIdempotentOp(String)
-  
-  Concurrent operation that is not idempotent. **Should not be retried.**
-  
-  ```rust
-  #[error("Broker error: non-idempotent operation {0}")]
-  BrokerNonIdempotentOp(String)
-  ```
-  
-  **When it occurs:**
-  - Multiple concurrent reads on the same queue (SurrealDB)
-  - Concurrent operations that conflict
-  
-  **How to handle:**
-  ```rust
-  match queue.try_consume("topic", None).await {
-      Ok(Some(msg)) => { /* process */ },
-      Err(BroccoliError::BrokerNonIdempotentOp(msg)) => {
-          // Log and skip this attempt
-          log::error!("Non-idempotent operation failed: {}", msg);
-          // Try again on next iteration, but don't retry immediately
-      }
-      _ => { /* other errors */ }
-  }
-  ```
-  
-  <Warning>
-    Do not retry `BrokerNonIdempotentOp` immediately. Wait for next cycle or use exponential backoff.
-  </Warning>
-  
-  ---
-  
-  ### BrokerNonIdempotentRetriableOp(String)
-  
-  Concurrent operation that is not idempotent but **can be safely retried**.
-  
-  ```rust
-  #[error("Broker error: non-idempotent retriable operation {0}")]
-  BrokerNonIdempotentRetriableOp(String)
-  ```
-  
-  **When it occurs:**
-  - Multiple concurrent writes on the same table (SurrealDB)
-  - Transient concurrent conflicts that resolve with retry
-  
-  **How to handle:**
-  ```rust
-  match queue.publish("topic", None, &msg, None).await {
-      Ok(published) => { /* use published message */ },
-      Err(BroccoliError::BrokerNonIdempotentRetriableOp(msg)) => {
-          // Safe to retry
-          log::warn!("Retryable non-idempotent operation: {}", msg);
-          tokio::time::sleep(Duration::from_millis(100)).await;
-          // Try again
-          let _ = queue.publish("topic", None, &msg, None).await;
-      }
-      _ => { /* other errors */ }
-  }
-  ```
-  
-  <Tip>
-    Use exponential backoff when retrying these operations to reduce contention.
-  </Tip>
-  
-  ---
-  
-  ### ConnectionTimeout(u32)
-  
-  Failed to establish connection within timeout period.
-  
-  ```rust
-  #[error("Connection timeout after {0} retries")]
-  ConnectionTimeout(u32)
-  ```
-  
-  **When it occurs:**
-  - Broker unreachable
-  - Network connectivity issues
-  - Broker startup delays
-  
-  **Parameters:**
-  - `u32` - Number of retry attempts made before timing out
-  
-  **How to handle:**
-  ```rust
-  match BroccoliQueue::builder("redis://localhost").build().await {
-      Ok(queue) => { /* use queue */ },
-      Err(BroccoliError::ConnectionTimeout(retries)) => {
-          eprintln!("Connection failed after {} retries", retries);
-          eprintln!("Check broker availability and network connectivity");
-          std::process::exit(1);
-      }
-      _ => { /* other errors */ }
-  }
-  ```
+
+### Broker(String)
+
+General broker operation error.
+
+```rust
+#[error("Broker error: {0}")]
+Broker(String)
+```
+
+**When it occurs:**
+- Broker connection failures
+- Connection pool initialization errors
+- Broker-specific protocol errors
+
+**How to handle:**
+```rust
+match queue.consume("topic", None).await {
+    Ok(msg) => { /* process */ },
+    Err(BroccoliError::Broker(msg)) => {
+        eprintln!("Broker error: {}", msg);
+        // Possibly retry queue creation or check broker availability
+    }
+    _ => { /* other errors */ }
+}
+```
+
+---
+
+### BrokerNonIdempotentOp(String)
+
+Concurrent operation that is not idempotent. **Should not be retried.**
+
+```rust
+#[error("Broker error: non-idempotent operation {0}")]
+BrokerNonIdempotentOp(String)
+```
+
+**When it occurs:**
+- Multiple concurrent reads on the same queue (SurrealDB)
+- Concurrent operations that conflict
+
+**How to handle:**
+```rust
+match queue.try_consume("topic", None).await {
+    Ok(Some(msg)) => { /* process */ },
+    Err(BroccoliError::BrokerNonIdempotentOp(msg)) => {
+        // Log and skip this attempt
+        log::error!("Non-idempotent operation failed: {}", msg);
+        // Try again on next iteration, but don't retry immediately
+    }
+    _ => { /* other errors */ }
+}
+```
+
+<Warning>
+  Do not retry `BrokerNonIdempotentOp` immediately. Wait for the next cycle or use exponential backoff.
+</Warning>
+
+---
+
+### BrokerNonIdempotentRetriableOp(String)
+
+Concurrent operation that is not idempotent but **can be safely retried**.
+
+```rust
+#[error("Broker error: non-idempotent retriable operation {0}")]
+BrokerNonIdempotentRetriableOp(String)
+```
+
+**When it occurs:**
+- Multiple concurrent writes on the same table (SurrealDB)
+- Transient concurrent conflicts that resolve with retry
+
+**How to handle:**
+```rust
+match queue.publish("topic", None, &msg, None).await {
+    Ok(published) => { /* use published message */ },
+    Err(BroccoliError::BrokerNonIdempotentRetriableOp(msg)) => {
+        // Safe to retry
+        log::warn!("Retryable non-idempotent operation: {}", msg);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Try again
+        let _ = queue.publish("topic", None, &msg, None).await;
+    }
+    _ => { /* other errors */ }
+}
+```
+
+<Tip>
+  Use exponential backoff when retrying these operations to reduce contention.
+</Tip>
+
+---
+
+### ConnectionTimeout(u32)
+
+Failed to establish a connection within the timeout period.
+
+```rust
+#[error("Connection timeout after {0} retries")]
+ConnectionTimeout(u32)
+```
+
+**When it occurs:**
+- Broker unreachable
+- Network connectivity issues
+- Broker startup delays
+
+**Parameters:**
+- `u32` — Number of retry attempts made before timing out
+
+**How to handle:**
+```rust
+match BroccoliQueue::builder("redis://localhost").build().await {
+    Ok(queue) => { /* use queue */ },
+    Err(BroccoliError::ConnectionTimeout(retries)) => {
+        eprintln!("Connection failed after {} retries", retries);
+        eprintln!("Check broker availability and network connectivity");
+        std::process::exit(1);
+    }
+    _ => { /* other errors */ }
+}
+```
 
 </Accordion>
 
 <Accordion title="Operation Errors">
-  
-  ### Publish(String)
-  
-  Failed to publish message to broker.
-  
-  ```rust
-  #[error("Failed to publish message: {0}")]
-  Publish(String)
-  ```
-  
-  **When it occurs:**
-  - Broker temporarily unavailable
-  - Message encoding fails
-  - Broker-side write errors
-  
-  **How to handle:**
-  ```rust
-  match queue.publish("jobs", None, &payload, None).await {
-      Ok(msg) => println!("Published {}", msg.task_id),
-      Err(BroccoliError::Publish(reason)) => {
-          eprintln!("Publish failed: {}", reason);
-          // Decide: retry, queue locally, or fail fast
-      }
-      _ => { /* other errors */ }
-  }
-  ```
-  
-  ---
-  
-  ### Consume(String)
-  
-  Failed to consume message from broker.
-  
-  ```rust
-  #[error("Failed to consume message: {0}")]
-  Consume(String)
-  ```
-  
-  **When it occurs:**
-  - Broker connection lost mid-operation
-  - Queue doesn't exist
-  - Message deserialization fails
-  
-  **How to handle:**
-  ```rust
-  match queue.consume("jobs", None).await {
-      Ok(msg) => { /* process */ },
-      Err(BroccoliError::Consume(reason)) => {
-          log::error!("Consume failed: {}", reason);
-          // For process_messages, these are handled internally
-          // For manual consume, reconnect and retry
-      }
-      _ => { /* other errors */ }
-  }
-  ```
-  
-  ---
-  
-  ### Acknowledge(String)
-  
-  Failed to acknowledge (remove) processed message.
-  
-  ```rust
-  #[error("Failed to acknowledge message: {0}")]
-  Acknowledge(String)
-  ```
-  
-  **When it occurs:**
-  - Broker disconnected after consuming
-  - Message already acknowledged
-  - Broker state corruption
-  
-  **How to handle:**
-  ```rust
-  // Manually acknowledging (if handler_ack disabled)
-  match queue.acknowledge("jobs", message).await {
-      Ok(_) => println!("Message acknowledged"),
-      Err(BroccoliError::Acknowledge(reason)) => {
-          log::error!("Failed to acknowledge: {}", reason);
-          // Message will be retried by broker
-          // Consider alerting ops
-      }
-      _ => { /* other errors */ }
-  }
-  ```
-  
-  <Tip>
-    If using `handler_ack: true` in `ConsumeOptions`, acknowledgment is automatic and most failures are logged but not fatal.
-  </Tip>
-  
-  ---
-  
-  ### Reject(String)
-  
-  Failed to reject (move to retry/failed queue) message.
-  
-  ```rust
-  #[error("Failed to reject message: {0}")]
-  Reject(String)
-  ```
-  
-  **When it occurs:**
-  - Broker disconnected
-  - Failed queue doesn't exist
-  - Attempt count corruption
-  
-  **How to handle:**
-  ```rust
-  match queue.reject("jobs", message).await {
-      Ok(_) => println!("Message rejected and requeued"),
-      Err(BroccoliError::Reject(reason)) => {
-          log::error!("Failed to reject message: {}", reason);
-          // Message state is uncertain
-          // May need manual intervention
-      }
-      _ => { /* other errors */ }
-  }
-  ```
-  
-  ---
-  
-  ### Cancel(String)
-  
-  Failed to cancel (permanently remove) message.
-  
-  ```rust
-  #[error("Failed to cancel message: {0}")]
-  Cancel(String)
-  ```
-  
-  **When it occurs:**
-  - Broker disconnected
-  - Message ID not found
-  - Insufficient permissions
-  
-  **How to handle:**
-  ```rust
-  match queue.cancel("jobs", message_id).await {
-      Ok(_) => println!("Message cancelled"),
-      Err(BroccoliError::Cancel(reason)) => {
-          log::warn!("Failed to cancel message: {}", reason);
-          // Message may still process
-      }
-      _ => { /* other errors */ }
-  }
-  ```
+
+### Publish(String)
+
+Failed to publish a message to the broker.
+
+```rust
+#[error("Failed to publish message: {0}")]
+Publish(String)
+```
+
+**When it occurs:**
+- Broker temporarily unavailable
+- Message encoding fails
+- Broker-side write errors
+
+**How to handle:**
+```rust
+match queue.publish("jobs", None, &payload, None).await {
+    Ok(msg) => println!("Published {}", msg.task_id),
+    Err(BroccoliError::Publish(reason)) => {
+        eprintln!("Publish failed: {}", reason);
+        // Decide: retry, queue locally, or fail fast
+    }
+    _ => { /* other errors */ }
+}
+```
+
+---
+
+### Consume(String)
+
+Failed to consume a message from the broker.
+
+```rust
+#[error("Failed to consume message: {0}")]
+Consume(String)
+```
+
+**When it occurs:**
+- Broker connection lost mid-operation
+- Queue doesn't exist
+- Message deserialization fails
+
+**How to handle:**
+```rust
+match queue.consume("jobs", None).await {
+    Ok(msg) => { /* process */ },
+    Err(BroccoliError::Consume(reason)) => {
+        log::error!("Consume failed: {}", reason);
+        // For process_messages, these are handled internally
+        // For manual consume, reconnect and retry
+    }
+    _ => { /* other errors */ }
+}
+```
+
+---
+
+### Acknowledge(String)
+
+Failed to acknowledge (remove) a processed message.
+
+```rust
+#[error("Failed to acknowledge message: {0}")]
+Acknowledge(String)
+```
+
+**When it occurs:**
+- Broker disconnected after consuming
+- Message already acknowledged
+- Broker state corruption
+
+**How to handle:**
+```rust
+// Manually acknowledging (if handler_ack disabled)
+match queue.acknowledge("jobs", message).await {
+    Ok(_) => println!("Message acknowledged"),
+    Err(BroccoliError::Acknowledge(reason)) => {
+        log::error!("Failed to acknowledge: {}", reason);
+        // Message will be retried by broker
+        // Consider alerting ops
+    }
+    _ => { /* other errors */ }
+}
+```
+
+<Tip>
+  If using `handler_ack: true` in `ConsumeOptions`, acknowledgment is automatic and most failures are logged but not fatal.
+</Tip>
+
+---
+
+### Reject(String)
+
+Failed to reject (move to retry/failed queue) a message.
+
+```rust
+#[error("Failed to reject message: {0}")]
+Reject(String)
+```
+
+**When it occurs:**
+- Broker disconnected
+- Failed queue doesn't exist
+- Attempt count corruption
+
+**How to handle:**
+```rust
+match queue.reject("jobs", message).await {
+    Ok(_) => println!("Message rejected and requeued"),
+    Err(BroccoliError::Reject(reason)) => {
+        log::error!("Failed to reject message: {}", reason);
+        // Message state is uncertain
+        // May need manual intervention
+    }
+    _ => { /* other errors */ }
+}
+```
+
+---
+
+### Cancel(String)
+
+Failed to cancel (permanently remove) a message.
+
+```rust
+#[error("Failed to cancel message: {0}")]
+Cancel(String)
+```
+
+**When it occurs:**
+- Broker disconnected
+- Message ID not found
+- Broker state issues
+
+**How to handle:**
+```rust
+match queue.cancel("jobs", message_id).await {
+    Ok(_) => println!("Message cancelled"),
+    Err(BroccoliError::Cancel(reason)) => {
+        log::warn!("Failed to cancel message: {}", reason);
+        // Message may still process
+    }
+    _ => { /* other errors */ }
+}
+```
 
 </Accordion>
 
 <Accordion title="Data Errors">
-  
-  ### Serialization(serde_json::Error)
-  
-  Failed to serialize or deserialize message payload.
-  
-  ```rust
-  #[error("Serialization error: {0}")]
-  Serialization(#[from] serde_json::Error)
-  ```
-  
-  **When it occurs:**
-  - Payload type doesn't implement `Serialize`/`Deserialize`
-  - Payload contains non-serializable types
-  - JSON data corruption in broker
-  - Type mismatch between publish and consume
-  
-  **How to handle:**
-  ```rust
-  #[derive(Serialize, Deserialize, Clone)]
-  struct MyPayload { /* ... */ }
-  
-  match queue.consume::<MyPayload>("jobs", None).await {
-      Ok(msg) => { /* process */ },
-      Err(BroccoliError::Serialization(err)) => {
-          eprintln!("Type mismatch or corruption: {}", err);
-          // Check your type definitions
-          // Possible fix: ensure all payload fields are serializable
-      }
-      _ => { /* other errors */ }
-  }
-  ```
-  
-  <Warning>
-    Serialization errors indicate either a programming error (missing Serialize derive) or data corruption. Check your types and data integrity.
-  </Warning>
-  
-  ---
-  
-  ### GetMessagePosition(String)
-  
-  Failed to retrieve message position in queue.
-  
-  ```rust
-  #[error("Failed to get message position: {0}")]
-  GetMessagePosition(String)
-  ```
-  
-  **When it occurs:**
-  - Feature not supported by broker (e.g., RabbitMQ)
-  - Message not found in queue
-  - Broker state inconsistency
-  
-  **How to handle:**
-  ```rust
-  match queue.get_message_position(message_id).await {
-      Ok(pos) => println!("Message is at position {}", pos),
-      Err(BroccoliError::GetMessagePosition(reason)) => {
-          if reason.contains("not implemented") {
-              // Feature not available on this broker
-              log::info!("Position tracking not supported");
-          } else {
-              log::error!("Failed to get position: {}", reason);
-          }
-      }
-      _ => { /* other errors */ }
-  }
-  ```
+
+### Serialization(serde_json::Error)
+
+Failed to serialize or deserialize a message payload.
+
+```rust
+#[error("Serialization error: {0}")]
+Serialization(#[from] serde_json::Error)
+```
+
+**When it occurs:**
+- Payload type doesn't implement `Serialize`/`Deserialize`
+- Payload contains non-serializable types
+- JSON data corruption in broker
+- Type mismatch between publish and consume
+
+**How to handle:**
+```rust
+#[derive(Serialize, Deserialize, Clone)]
+struct MyPayload { /* ... */ }
+
+match queue.consume::<MyPayload>("jobs", None).await {
+    Ok(msg) => { /* process */ },
+    Err(BroccoliError::Serialization(err)) => {
+        eprintln!("Type mismatch or corruption: {}", err);
+        // Check your type definitions
+        // Possible fix: ensure all payload fields are serializable
+    }
+    _ => { /* other errors */ }
+}
+```
+
+<Warning>
+  Serialization errors indicate either a programming error (missing `Serialize` derive) or data corruption. Check your types and data integrity.
+</Warning>
+
+---
+
+### GetMessagePosition(String)
+
+Failed to retrieve the message position in the queue.
+
+```rust
+#[error("Failed to get message position: {0}")]
+GetMessagePosition(String)
+```
+
+**When it occurs:**
+- Feature not supported by the broker backend
+- Message not found in queue
+- Broker state inconsistency
+
+**How to handle:**
+```rust
+match queue.get_message_position(message_id).await {
+    Ok(pos) => println!("Message is at position {}", pos),
+    Err(BroccoliError::GetMessagePosition(reason)) => {
+        if reason.contains("not implemented") {
+            // Feature not available on this broker
+            log::info!("Position tracking not supported");
+        } else {
+            log::error!("Failed to get position: {}", reason);
+        }
+    }
+    _ => { /* other errors */ }
+}
+```
 
 </Accordion>
 
 <Accordion title="Backend-Specific Errors">
-  
-  ### Redis(redis::RedisError)
-  
-  Redis client error (requires `redis` feature).
-  
-  ```rust
-  #[cfg(feature = "redis")]
-  #[error("Redis error: {0}")]
-  Redis(#[from] redis::RedisError)
-  ```
-  
-  **When it occurs:**
-  - Redis server connection error
-  - Redis command execution error
-  - Redis authentication failure
-  
-  **How to handle:**
-  ```rust
-  #[cfg(feature = "redis")]
-  match queue.publish("topic", None, &msg, None).await {
-      Ok(published) => { /* use */ },
-      Err(BroccoliError::Redis(err)) => {
-          log::error!("Redis error: {}", err);
-          // Check Redis connectivity
-          // Verify authentication credentials
-      }
-      _ => { /* other errors */ }
-  }
-  ```
-  
-  ---
-  
-  ### SurrealDB(surrealdb::Error)
-  
-  SurrealDB client error (requires `surrealdb` feature).
-  
-  ```rust
-  #[cfg(feature = "surrealdb")]
-  #[error("SurrealDB error: {0}")]
-  SurrealDB(#[from] surrealdb::Error)
-  ```
-  
-  **When it occurs:**
-  - SurrealDB connection error
-  - Database query failure
-  - Schema/table issues
-  
-  **How to handle:**
-  ```rust
-  #[cfg(feature = "surrealdb")]
-  match queue.consume("topic", None).await {
-      Ok(msg) => { /* process */ },
-      Err(BroccoliError::SurrealDB(err)) => {
-          log::error!("SurrealDB error: {}", err);
-          // Check database connectivity
-          // Verify database schema exists
-      }
-      _ => { /* other errors */ }
-  }
-  ```
+
+### Redis(redis::RedisError)
+
+Redis client error (requires the `redis` feature).
+
+```rust
+#[cfg(feature = "redis")]
+#[error("Redis error: {0}")]
+Redis(#[from] redis::RedisError)
+```
+
+**When it occurs:**
+- Redis server connection error
+- Redis command execution error
+- Redis authentication failure
+
+**How to handle:**
+```rust
+#[cfg(feature = "redis")]
+match queue.publish("topic", None, &msg, None).await {
+    Ok(published) => { /* use */ },
+    Err(BroccoliError::Redis(err)) => {
+        log::error!("Redis error: {}", err);
+        // Check Redis connectivity
+        // Verify authentication credentials
+    }
+    _ => { /* other errors */ }
+}
+```
+
+---
+
+### SurrealDB(surrealdb::Error)
+
+SurrealDB client error (requires the `surrealdb` feature).
+
+```rust
+#[cfg(feature = "surrealdb")]
+#[error("SurrealDB error: {0}")]
+SurrealDB(#[from] surrealdb::Error)
+```
+
+**When it occurs:**
+- SurrealDB connection error
+- Database query failure
+- Schema/table issues
+
+**How to handle:**
+```rust
+#[cfg(feature = "surrealdb")]
+match queue.consume("topic", None).await {
+    Ok(msg) => { /* process */ },
+    Err(BroccoliError::SurrealDB(err)) => {
+        log::error!("SurrealDB error: {}", err);
+        // Check database connectivity
+        // Verify database schema exists
+    }
+    _ => { /* other errors */ }
+}
+```
 
 </Accordion>
 
 <Accordion title="Other Errors">
-  
-  ### Job(String)
-  
-  Error during job/message processing.
-  
-  ```rust
-  #[error("Job error: {0}")]
-  Job(String)
-  ```
-  
-  **When it occurs:**
-  - Handler function returns error
-  - Business logic failure
-  - External service error
-  
-  **How to handle:**
-  ```rust
-  queue.process_messages("jobs", None, None, |msg| async {
-      match my_handler(&msg).await {
-          Ok(_) => Ok(()),
-          Err(e) => {
-              // Wrap business errors
-              Err(BroccoliError::Job(e.to_string()))
-          }
-      }
-  }).await?;
-  ```
-  
-  ---
-  
-  ### QueueStatus(String)
-  
-  Failed to retrieve queue status information.
-  
-  ```rust
-  #[error("Queue status error: {0}")]
-  QueueStatus(String)
-  ```
-  
-  **When it occurs:**
-  - Management feature not enabled
-  - Queue doesn't exist
-  - Insufficient permissions
-  
-  **How to handle:**
-  ```rust
-  #[cfg(feature = "management")]
-  match queue.queue_status("jobs".to_string(), None).await {
-      Ok(status) => println!("Queue size: {}", status.size),
-      Err(BroccoliError::QueueStatus(reason)) => {
-          log::error!("Cannot get status: {}", reason);
-      }
-      _ => { /* other errors */ }
-  }
-  ```
-  
-  ---
-  
-  ### NotImplemented
-  
-  Feature not implemented for this broker backend.
-  
-  ```rust
-  #[error("Feature not implemented")]
-  NotImplemented
-  ```
-  
-  **When it occurs:**
-  - Calling `get_message_position()` on RabbitMQ
-  - Feature-specific method on unsupported backend
-  - Scheduling with broker that doesn't support it
-  
-  **How to handle:**
-  ```rust
-  match queue.get_message_position(msg_id).await {
-      Ok(pos) => println!("Position: {}", pos),
-      Err(BroccoliError::NotImplemented) => {
-          log::info!("This broker doesn't support message position tracking");
-          // Use alternative approach or skip feature
-      }
-      _ => { /* other errors */ }
-  }
-  ```
+
+### Job(String)
+
+Error during job/message processing.
+
+```rust
+#[error("Job error: {0}")]
+Job(String)
+```
+
+**When it occurs:**
+- Handler function returns an error
+- Business logic failure
+- External service error
+
+**How to handle:**
+```rust
+queue.process_messages("jobs", None, None, |msg| async {
+    match my_handler(&msg).await {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            // Wrap business errors
+            Err(BroccoliError::Job(e.to_string()))
+        }
+    }
+}).await?;
+```
+
+---
+
+### QueueStatus(String)
+
+Failed to retrieve queue status information.
+
+```rust
+#[error("Queue status error: {0}")]
+QueueStatus(String)
+```
+
+**When it occurs:**
+- Management feature not enabled
+- Queue doesn't exist
+- Broker state issues
+
+**How to handle:**
+```rust
+#[cfg(feature = "management")]
+match queue.queue_status("jobs".to_string(), None).await {
+    Ok(status) => println!("Queue size: {}", status.size),
+    Err(BroccoliError::QueueStatus(reason)) => {
+        log::error!("Cannot get status: {}", reason);
+    }
+    _ => { /* other errors */ }
+}
+```
+
+---
+
+### NotImplemented
+
+Feature not implemented for this broker backend.
+
+```rust
+#[error("Feature not implemented")]
+NotImplemented
+```
+
+**When it occurs:**
+- Calling `get_message_position()` on RabbitMQ
+- Feature-specific method on an unsupported backend
+
+**How to handle:**
+```rust
+match queue.get_message_position(msg_id).await {
+    Ok(pos) => println!("Position: {}", pos),
+    Err(BroccoliError::NotImplemented) => {
+        log::info!("This broker doesn't support message position tracking");
+        // Use alternative approach or skip feature
+    }
+    _ => { /* other errors */ }
+}
+```
 
 </Accordion>
 
@@ -542,11 +541,11 @@ match queue.consume("topic", None).await {
 ```rust
 async fn process_workflow() -> Result<(), BroccoliError> {
     let queue = BroccoliQueue::builder("redis://localhost").build().await?;
-    
+
     let msg = queue.consume("jobs", None).await?; // Propagate any error
     handle_message(&msg).await?;
     queue.acknowledge("jobs", msg).await?;
-    
+
     Ok(())
 }
 ```
@@ -624,9 +623,10 @@ let msg = queue
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-#[error("Application error: {0}")]
 pub enum AppError {
+    #[error("Queue error: {0}")]
     Queue(#[from] BroccoliError),
+    #[error("Custom error: {0}")]
     Custom(String),
 }
 
